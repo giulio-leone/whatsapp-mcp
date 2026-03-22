@@ -181,3 +181,14 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+
+## License
+
+This project is licensed under the **Business Source License 1.1 (BSL)**.
+
+**You may use this software for non-commercial and non-production purposes (e.g., development, testing, research, and personal projects) free of charge.**
+
+**Commercial and production use is strictly prohibited without prior written authorization.**
+
+On March 22, 2030 (the Change Date), this license automatically converts to the **Apache License, Version 2.0**.
