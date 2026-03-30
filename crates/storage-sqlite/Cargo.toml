@@ -1,0 +1,15 @@
+[package]
+name = "wa-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+wa-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+async-trait = "0.1"

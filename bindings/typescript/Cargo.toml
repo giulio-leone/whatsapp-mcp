@@ -1,0 +1,9 @@
+[package]
+name = "wa-typescript-bindings"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+wa-domain = { path = "../../crates/domain" }
+wa-mcp-server = { path = "../../crates/mcp-server" }
