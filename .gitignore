@@ -1,0 +1,33 @@
+# Build artifacts
+/target/
+target/
+bridge/wa-bridge
+
+# Cargo lock (library — regenerated on build)
+Cargo.lock
+
+# Editor swap files
+**/*.rs.bk
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# SQLite databases (runtime state, not source)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.iml

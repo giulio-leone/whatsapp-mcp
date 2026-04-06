@@ -46,7 +46,7 @@ impl McpServer {
                 Ok(r) => r,
                 Err(e) => {
                     let err_response = JsonRpcResponse::error(
-                        serde_json::Value::Null,
+                        None,
                         -32700,
                         format!("Parse error: {e}"),
                     );
@@ -56,6 +56,12 @@ impl McpServer {
                     continue;
                 }
             };
+
+            // JSON-RPC notifications have no id — never send a response for them
+            if request.id.is_none() || request.method.starts_with("notifications/") {
+                tracing::debug!("Received notification: {}", request.method);
+                continue;
+            }
 
             let response = self.handle_request(&request).await;
             let out = serde_json::to_string(&response)? + "\n";
@@ -69,11 +75,6 @@ impl McpServer {
     async fn handle_request(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req),
-            "notifications/initialized" => {
-                // Client acknowledged — no response needed for notifications,
-                // but we return an empty success to avoid breaking the loop.
-                JsonRpcResponse::success(req.id.clone(), json!({}))
-            }
             "tools/list" => self.handle_tools_list(req),
             "tools/call" => self.handle_tools_call(req).await,
             _ => JsonRpcResponse::error(
@@ -332,19 +333,23 @@ impl McpServer {
     }
 
     async fn tool_connection_status(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
-        // For now, try to connect and report status
-        let status = match self.wa_client.connect().await {
-            Ok(()) => json!({
+        // Check cached state — never trigger a reconnect from status check
+        let is_connected = match self.wa_client.list_chats().await {
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        let status = if is_connected {
+            json!({
                 "connected": true,
                 "status": "active",
                 "suggestion": "Session is healthy. You can use list_chats, get_messages, or send_message."
-            }),
-            Err(e) => json!({
+            })
+        } else {
+            json!({
                 "connected": false,
                 "status": "disconnected",
-                "error": e.to_string(),
                 "suggestion": "Session is not active. The user may need to scan a QR code to reconnect."
-            }),
+            })
         };
         let result = ToolResult {
             content: vec![ToolResultContent {

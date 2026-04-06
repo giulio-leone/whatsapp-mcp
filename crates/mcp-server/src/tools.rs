@@ -8,7 +8,7 @@
 //! - **ToolAnnotations**: readOnly/destructive/idempotent/openWorld hints.
 //! - **Cursor-based pagination**: Deterministic, prevents hallucination.
 
-use crate::protocol::{ToolAnnotations, ToolDefinition};
+use crate::protocol::ToolDefinition;
 use serde_json::json;
 
 /// Returns the full list of tools this MCP server exposes.
@@ -48,13 +48,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 },
                 "additionalProperties": false
             }),
-            annotations: Some(ToolAnnotations {
-                title: Some("List WhatsApp Chats".into()),
-                read_only_hint: Some(true),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(true),
-                open_world_hint: Some(true),
-            }),
         },
 
         ToolDefinition {
@@ -88,13 +81,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["chat_id"],
                 "additionalProperties": false
             }),
-            annotations: Some(ToolAnnotations {
-                title: Some("Get Chat Messages".into()),
-                read_only_hint: Some(true),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(true),
-                open_world_hint: Some(true),
-            }),
         },
 
         ToolDefinition {
@@ -116,13 +102,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            annotations: Some(ToolAnnotations {
-                title: Some("Search Contacts".into()),
-                read_only_hint: Some(true),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(true),
-                open_world_hint: Some(false),
-            }),
         },
 
         ToolDefinition {
@@ -143,13 +122,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 },
                 "required": ["chat_id"],
                 "additionalProperties": false
-            }),
-            annotations: Some(ToolAnnotations {
-                title: Some("Get Chat Info".into()),
-                read_only_hint: Some(true),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(true),
-                open_world_hint: Some(true),
             }),
         },
 
@@ -179,13 +151,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["chat_id", "text"],
                 "additionalProperties": false
             }),
-            annotations: Some(ToolAnnotations {
-                title: Some("Send Message".into()),
-                read_only_hint: Some(false),
-                destructive_hint: Some(true),
-                idempotent_hint: Some(false),
-                open_world_hint: Some(true),
-            }),
         },
 
         // ─── UTILITY TOOLS ──────────────────────────────────────────
@@ -202,13 +167,6 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
-            }),
-            annotations: Some(ToolAnnotations {
-                title: Some("Connection Status".into()),
-                read_only_hint: Some(true),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(true),
-                open_world_hint: Some(true),
             }),
         },
     ]

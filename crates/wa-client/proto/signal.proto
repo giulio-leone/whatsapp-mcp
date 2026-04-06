@@ -1,0 +1,31 @@
+syntax = "proto3";
+package signal;
+
+message SignalMessage {
+    bytes ratchetingKey = 1;
+    uint32 counter = 2;
+    uint32 previousCounter = 3;
+    bytes ciphertext = 4;
+}
+
+message PreKeySignalMessage {
+    uint32 registrationId = 1;
+    uint32 preKeyId = 2;
+    uint32 signedPreKeyId = 3;
+    bytes baseKey = 4;
+    bytes identityKey = 5;
+    bytes message = 6; // Serialized SignalMessage
+}
+
+message SenderKeyMessage {
+    uint32 id = 1;
+    uint32 iteration = 2;
+    bytes ciphertext = 3;
+}
+
+message SenderKeyDistributionMessage {
+    uint32 id = 1;
+    uint32 iteration = 2;
+    bytes chainKey = 3;
+    bytes signaturePubKey = 4;
+}
