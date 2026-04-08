@@ -437,6 +437,10 @@ impl WhatsAppClientPort for WhatsAppClient {
         let store = self.store.lock().await;
         Ok(store.chats.values().cloned().collect())
     }
+
+    async fn send_image(&self, chat_id: &ChatId, image_bytes: &[u8], mime: &str, caption: Option<&str>) -> Result<Message> {
+        self.send_image_impl(chat_id, image_bytes, mime, caption).await
+    }
 }
 
 // ─── Presence Subscription ──────────────────────────────────────────
@@ -471,6 +475,200 @@ impl WhatsAppClient {
         self.send_node(&node).await?;
         tracing::info!("Sent own presence: available");
         Ok(())
+    }
+}
+
+// ─── Media Upload ───────────────────────────────────────────────────
+
+impl WhatsAppClient {
+    /// Request media upload credentials from WhatsApp server.
+    /// Sends an IQ query for media_conn and parses the response.
+    pub async fn request_media_conn(&self) -> Result<crate::media::MediaConnInfo> {
+        let id = format!("{:x}", rand::random::<u64>());
+        let media_conn_node = Node::new("media_conn", HashMap::new(), Content::None);
+
+        let mut iq_attrs = HashMap::new();
+        iq_attrs.insert("id".to_string(), AttrValue::String(id));
+        iq_attrs.insert("type".to_string(), AttrValue::String("set".to_string()));
+        iq_attrs.insert("xmlns".to_string(), AttrValue::String("w:m".to_string()));
+
+        let iq_node = Node::new("iq", iq_attrs, Content::Nodes(vec![media_conn_node]));
+        let response = self.send_iq(iq_node).await?;
+
+        // Parse response: <iq><media_conn auth="..." ...><host hostname="..."/></media_conn></iq>
+        let mc_node = response.get_child_by_tag("media_conn")
+            .ok_or_else(|| anyhow!("No media_conn in IQ response"))?;
+
+        let auth = mc_node.get_attr("auth")
+            .ok_or_else(|| anyhow!("No auth in media_conn"))?
+            .to_string();
+
+        let mut hosts = Vec::new();
+        if let Content::Nodes(children) = &mc_node.content {
+            for child in children {
+                if child.tag == "host" {
+                    if let Some(hostname) = child.get_attr("hostname") {
+                        hosts.push(crate::media::MediaHost {
+                            hostname: hostname.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if hosts.is_empty() {
+            // Fallback to default host
+            hosts.push(crate::media::MediaHost {
+                hostname: "mmg.whatsapp.net".to_string(),
+            });
+        }
+
+        tracing::info!("Media conn: auth={}..., {} hosts", &auth[..auth.len().min(10)], hosts.len());
+        Ok(crate::media::MediaConnInfo { auth, hosts })
+    }
+
+    /// Send an image message to a chat.
+    ///
+    /// Encrypts the image, uploads to WhatsApp CDN, then sends the proto-wrapped
+    /// ImageMessage through the normal multi-device encryption pipeline.
+    pub async fn send_image_impl(&self, chat_id: &ChatId, image_bytes: &[u8], mime: &str, caption: Option<&str>) -> Result<Message> {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use crate::media::{MediaType, encrypt_media, upload_media};
+
+        let jid = chat_id.0.clone();
+        let full_jid = if jid.contains('@') { jid.clone() } else { format!("{}@s.whatsapp.net", jid) };
+        let user_part = full_jid.split('@').next().unwrap_or(&full_jid);
+
+        tracing::info!("Sending image ({} bytes, {}) to {}", image_bytes.len(), mime, full_jid);
+
+        // 1. Encrypt the media
+        let encrypted = encrypt_media(image_bytes, MediaType::Image)?;
+
+        // 2. Get upload credentials
+        let conn = self.request_media_conn().await?;
+
+        // 3. Upload encrypted media
+        let upload_result = upload_media(&encrypted, MediaType::Image, &conn).await?;
+        tracing::info!("Image uploaded: {}", upload_result.direct_path);
+
+        // 4. Build ImageMessage proto
+        let now_ts = chrono::Utc::now().timestamp();
+        let image_msg = e2e::ImageMessage {
+            url: Some(upload_result.url),
+            direct_path: Some(upload_result.direct_path),
+            mimetype: Some(mime.to_string()),
+            caption: caption.map(|c| c.to_string()),
+            file_sha256: Some(encrypted.file_sha256),
+            file_enc_sha256: Some(encrypted.file_enc_sha256),
+            file_length: Some(encrypted.file_length),
+            media_key: Some(encrypted.media_key),
+            media_key_timestamp: Some(now_ts),
+            height: None,
+            width: None,
+            jpeg_thumbnail: None,
+            context_info: None,
+            first_scan_sidecar: None,
+            first_scan_length: None,
+            experiment_group_id: None,
+            scans_sidecar: None,
+            scan_lengths: vec![],
+            mid_quality_file_sha256: None,
+            mid_quality_file_enc_sha256: None,
+            view_once: None,
+            thumbnail_direct_path: None,
+            thumbnail_sha256: None,
+            thumbnail_enc_sha256: None,
+            static_url: None,
+            annotations: vec![],
+            interactive_annotations: vec![],
+            image_source_type: None,
+            accessibility_label: None,
+            qr_url: None,
+        };
+
+        let msg = e2e::Message {
+            image_message: Some(Box::new(image_msg)),
+            ..Default::default()
+        };
+
+        let mut e2e_bytes = Vec::new();
+        msg.encode(&mut e2e_bytes)?;
+        let padded = Self::pad_message(&e2e_bytes);
+
+        // 5. Multi-device encrypt + send (same as send_message)
+        let recipient_devices = self.discover_devices(user_part).await;
+        let mut to_nodes = Vec::new();
+        let mut sessions_to_persist: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for device_id in &recipient_devices {
+            let device_jid = format!("{}:{}@s.whatsapp.net", user_part, device_id);
+            match self.encrypt_for_device(&device_jid, &padded).await {
+                Ok((enc_type, envelope, session)) => {
+                    let mut enc_attrs = HashMap::new();
+                    enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
+                    enc_attrs.insert("type".to_string(), AttrValue::String(enc_type));
+                    let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
+
+                    let mut to_attrs = HashMap::new();
+                    to_attrs.insert("jid".to_string(), AttrValue::String(device_jid.clone()));
+                    let to_node = Node::new("to", to_attrs, Content::Nodes(vec![enc_node]));
+                    to_nodes.push(to_node);
+
+                    let session_bytes = serde_json::to_vec(&session)?;
+                    sessions_to_persist.push((device_jid, session_bytes));
+                }
+                Err(e) => tracing::warn!("Failed to encrypt image for {}: {}", device_jid, e),
+            }
+        }
+
+        if to_nodes.is_empty() {
+            anyhow::bail!("Failed to encrypt image for any device");
+        }
+
+        // Generate message ID
+        let msg_id = {
+            let store = self.store.lock().await;
+            let our_jid_full = store.our_jid.clone().unwrap_or_default();
+            let random_bytes: [u8; 4] = rand::random();
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(our_jid_full.as_bytes());
+            hasher.update(&random_bytes);
+            let hash = hasher.finalize();
+            format!("3EB0{}", hex::encode(&hash[..9]).to_uppercase())
+        };
+
+        let participants_node = Node::new("participants", HashMap::new(), Content::Nodes(to_nodes));
+        let mut msg_attrs = HashMap::new();
+        msg_attrs.insert("id".to_string(), AttrValue::String(msg_id.clone()));
+        msg_attrs.insert("to".to_string(), AttrValue::String(full_jid));
+        msg_attrs.insert("type".to_string(), AttrValue::String("media".to_string()));
+        msg_attrs.insert("mediatype".to_string(), AttrValue::String("image".to_string()));
+        let message_node = Node::new("message", msg_attrs, Content::Nodes(vec![participants_node]));
+
+        self.send_node(&message_node).await?;
+
+        // Persist sessions
+        {
+            let mut store = self.store.lock().await;
+            for (jid, bytes) in sessions_to_persist {
+                store.save_session(jid, bytes);
+            }
+        }
+        let _ = self.persist_store().await;
+        tracing::info!("Image sent (msg: {})", msg_id);
+
+        Ok(Message {
+            id: MessageId(msg_id),
+            chat_id: chat_id.clone(),
+            sender_id: "me".to_string(),
+            text: caption.map(|c| c.to_string()),
+            media: None,
+            timestamp: now_ts,
+            is_from_me: true,
+            is_forwarded: false,
+            reply_to_id: None,
+        })
     }
 }
 

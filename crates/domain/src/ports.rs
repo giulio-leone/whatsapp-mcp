@@ -13,6 +13,8 @@ pub trait WhatsAppClientPort: Send + Sync {
     async fn send_message(&self, chat_id: &ChatId, text: &str) -> Result<Message>;
     /// Sends an emoji reaction to a message
     async fn send_reaction(&self, chat_id: &ChatId, message_id: &str, emoji: &str) -> Result<()>;
+    /// Sends an image message with optional caption
+    async fn send_image(&self, chat_id: &ChatId, image_bytes: &[u8], mime: &str, caption: Option<&str>) -> Result<Message>;
     /// Retrieves full list of chats available in the current WA multi-device state
     async fn list_chats(&self) -> Result<Vec<Chat>>;
 }

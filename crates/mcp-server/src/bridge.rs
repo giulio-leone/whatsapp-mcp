@@ -161,6 +161,28 @@ impl WhatsAppClientPort for BridgeClient {
         Ok(())
     }
 
+    async fn send_image(&self, chat_id: &ChatId, image_bytes: &[u8], mime: &str, caption: Option<&str>) -> Result<Message> {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, image_bytes);
+        let result = self.rpc("send_image", json!({
+            "chat_id": chat_id.0,
+            "image_base64": b64,
+            "mime": mime,
+            "caption": caption
+        })).await?;
+
+        Ok(Message {
+            id: MessageId(result["id"].as_str().unwrap_or("").to_string()),
+            chat_id: chat_id.clone(),
+            sender_id: "me".to_string(),
+            text: caption.map(|c| c.to_string()),
+            media: None,
+            timestamp: result["timestamp"].as_i64().unwrap_or(0),
+            is_from_me: true,
+            is_forwarded: false,
+            reply_to_id: None,
+        })
+    }
+
     async fn list_chats(&self) -> Result<Vec<Chat>> {
         let result = self.rpc("list_chats", json!({})).await?;
         let chats = result["chats"]

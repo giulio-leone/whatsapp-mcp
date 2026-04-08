@@ -8,8 +8,9 @@ async fn main() -> anyhow::Result<()> {
 
     if args.len() < 2 || args.contains(&"--help".to_string()) {
         eprintln!("Usage:");
-        eprintln!("  wa-status publish <text>        Publish a text status");
-        eprintln!("  wa-status react <status_jid> <status_id> <emoji>   React to a status");
+        eprintln!("  wa-status publish <text>                              Publish a text status");
+        eprintln!("  wa-status image <path> [caption]                      Publish an image status");
+        eprintln!("  wa-status react <status_jid> <status_id> <emoji>      React to a status");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --fresh   Clear signal sessions before connecting");
@@ -43,10 +44,39 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("Usage: wa-status publish <text>");
             }
             eprintln!("📝 Publishing status: {}", text);
-
-            // Status messages are sent to status@broadcast JID
             client.send_message(&ChatId("status@broadcast".into()), &text).await?;
             eprintln!("✅ Status published!");
+        }
+        "image" => {
+            if filtered_args.len() < 2 {
+                anyhow::bail!("Usage: wa-status image <path> [caption]");
+            }
+            let path = filtered_args[1];
+            let caption = if filtered_args.len() > 2 {
+                Some(filtered_args[2..].join(" "))
+            } else {
+                None
+            };
+
+            let image_bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("Failed to read image file '{}': {}", path, e))?;
+
+            let mime = match path.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "webp" => "image/webp",
+                "gif" => "image/gif",
+                _ => "image/jpeg",
+            };
+
+            eprintln!("🖼️  Publishing image status: {} ({} bytes, {})", path, image_bytes.len(), mime);
+            client.send_image(
+                &ChatId("status@broadcast".into()),
+                &image_bytes,
+                mime,
+                caption.as_deref(),
+            ).await?;
+            eprintln!("✅ Image status published!");
         }
         "react" => {
             if filtered_args.len() < 4 {
@@ -56,15 +86,11 @@ async fn main() -> anyhow::Result<()> {
             let status_id = filtered_args[2];
             let emoji = filtered_args[3];
             eprintln!("💬 Reacting to status {} from {} with {}", status_id, status_jid, emoji);
-
-            // Reactions are sent as special messages with ReactionMessage proto
-            // For now, use the send_message with a reaction wrapper
-            // TODO: implement proper ReactionMessage encoding when proto is compiled to Rust
             client.send_reaction(&ChatId(format!("{}@s.whatsapp.net", status_jid)), status_id, emoji).await?;
             eprintln!("✅ Reaction sent!");
         }
         _ => {
-            anyhow::bail!("Unknown subcommand: {}. Use 'publish' or 'react'.", subcommand);
+            anyhow::bail!("Unknown subcommand: {}. Use 'publish', 'image', or 'react'.", subcommand);
         }
     }
 

@@ -5,6 +5,7 @@ pub mod store;
 pub mod crypto;
 pub mod usync;
 pub mod qr;
+pub mod media;
 
 pub mod proto {
     pub mod wa_web_protobufs_e2e {
