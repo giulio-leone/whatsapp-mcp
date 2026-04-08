@@ -70,6 +70,12 @@ async fn main() -> anyhow::Result<()> {
 
     let client = WhatsAppClient::with_db_path(&db_path);
 
+    // Apply stealth mode if --stealth flag present
+    if args.iter().any(|a| a == "--stealth" || a == "-s") {
+        client.set_stealth(true);
+        eprintln!("🕵️ Stealth mode ACTIVE");
+    }
+
     eprintln!("   Connecting...");
     client.connect().await?;
 

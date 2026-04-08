@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let client = cli_common::create_client(&db_path)?;
+    cli_common::apply_stealth_flag(&client);
     eprintln!("   Connecting...");
     let jid = cli_common::connect_and_wait(&client, 15).await?;
     eprintln!("✅ Connected as: {}", jid);

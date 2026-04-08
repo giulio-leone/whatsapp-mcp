@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     // Create and connect client
     let db_path = cli_common::resolve_db_path();
     let client = cli_common::create_client(&db_path)?;
+    cli_common::apply_stealth_flag(&client);
 
     if fresh {
         eprintln!("   Clearing signal sessions...");

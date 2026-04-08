@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
     cli_common::init_tracing();
     let db_path = cli_common::resolve_db_path();
     let client = cli_common::create_client(&db_path)?;
+    cli_common::apply_stealth_flag(&client);
 
     if fresh {
         cli_common::clear_sessions_for(&db_path, "status")?;

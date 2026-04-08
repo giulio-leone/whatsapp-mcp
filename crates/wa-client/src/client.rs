@@ -56,6 +56,7 @@ pub struct WhatsAppClient {
     event_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<WhatsAppEvent>>>,
     state: Arc<Mutex<ConnectionState>>,
     db_path: String,
+    stealth: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct WhatsAppClientInner {
@@ -103,7 +104,20 @@ impl WhatsAppClient {
             event_rx: Arc::new(Mutex::new(event_rx)),
             state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
             db_path: db_path.to_string(),
+            stealth: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Enable or disable stealth mode.
+    /// When enabled: no read receipts, no online presence, no typing indicators,
+    /// no status view receipts — fully invisible to contacts.
+    pub fn set_stealth(&self, enabled: bool) {
+        self.stealth.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("🕵️ Stealth mode: {}", if enabled { "ON" } else { "OFF" });
+    }
+
+    pub fn is_stealth(&self) -> bool {
+        self.stealth.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn next_event(&self) -> Option<WhatsAppEvent> {
@@ -482,12 +496,73 @@ impl WhatsAppClient {
     }
 
     /// Send our own presence as available (required before receiving presence updates).
+    /// In stealth mode, sends "unavailable" instead to remain invisible.
     pub async fn send_available_presence(&self) -> Result<()> {
         let mut attrs = HashMap::new();
-        attrs.insert("type".to_string(), AttrValue::String("available".to_string()));
-        let node = Node::new("presence", attrs, Content::None);
+        if self.is_stealth() {
+            attrs.insert("type".to_string(), AttrValue::String("unavailable".to_string()));
+            let node = Node::new("presence", attrs, Content::None);
+            self.send_node(&node).await?;
+            tracing::info!("🕵️ Stealth: sent presence as unavailable (invisible)");
+        } else {
+            attrs.insert("type".to_string(), AttrValue::String("available".to_string()));
+            let node = Node::new("presence", attrs, Content::None);
+            self.send_node(&node).await?;
+            tracing::info!("Sent own presence: available");
+        }
+        Ok(())
+    }
+
+    /// Send a read receipt for a message. Blocked in stealth mode (no blue ticks).
+    pub async fn send_read_receipt(&self, chat_jid: &str, msg_id: &str) -> Result<()> {
+        if self.is_stealth() {
+            tracing::info!("🕵️ Stealth: suppressed read receipt for {} in {}", msg_id, chat_jid);
+            return Ok(());
+        }
+        let mut attrs = HashMap::new();
+        attrs.insert("to".to_string(), AttrValue::String(chat_jid.to_string()));
+        attrs.insert("id".to_string(), AttrValue::String(msg_id.to_string()));
+        attrs.insert("type".to_string(), AttrValue::String("read".to_string()));
+        let node = Node::new("receipt", attrs, Content::None);
         self.send_node(&node).await?;
-        tracing::info!("Sent own presence: available");
+        tracing::info!("Sent read receipt for {} to {}", msg_id, chat_jid);
+        Ok(())
+    }
+
+    /// Send a typing indicator (composing/paused). Blocked in stealth mode.
+    pub async fn send_typing_indicator(&self, chat_jid: &str, composing: bool) -> Result<()> {
+        if self.is_stealth() {
+            tracing::info!("🕵️ Stealth: suppressed typing indicator for {}", chat_jid);
+            return Ok(());
+        }
+        let state_tag = if composing { "composing" } else { "paused" };
+        let state_node = Node::new(state_tag, HashMap::new(), Content::None);
+        let mut attrs = HashMap::new();
+        attrs.insert("to".to_string(), AttrValue::String(chat_jid.to_string()));
+        let node = Node::new("chatstate", attrs, Content::Nodes(vec![state_node]));
+        self.send_node(&node).await?;
+        tracing::info!("Sent typing indicator '{}' to {}", state_tag, chat_jid);
+        Ok(())
+    }
+
+    /// Send a status view receipt. Blocked in stealth mode (anonymous viewing).
+    pub async fn send_status_view(&self, status_jid: &str, msg_id: &str) -> Result<()> {
+        if self.is_stealth() {
+            tracing::info!("🕵️ Stealth: suppressed status view receipt for {} from {}", msg_id, status_jid);
+            return Ok(());
+        }
+        let mut attrs = HashMap::new();
+        attrs.insert("to".to_string(), AttrValue::String("status@broadcast".to_string()));
+        attrs.insert("id".to_string(), AttrValue::String(msg_id.to_string()));
+        attrs.insert("type".to_string(), AttrValue::String("read".to_string()));
+
+        let mut participant_attrs = HashMap::new();
+        participant_attrs.insert("jid".to_string(), AttrValue::String(status_jid.to_string()));
+        let participant_node = Node::new("participant", participant_attrs, Content::None);
+
+        let node = Node::new("receipt", attrs, Content::Nodes(vec![participant_node]));
+        self.send_node(&node).await?;
+        tracing::info!("Sent status view receipt for {} from {}", msg_id, status_jid);
         Ok(())
     }
 }

@@ -93,3 +93,16 @@ pub fn read_contacts_file(path: &str) -> anyhow::Result<Vec<String>> {
     }
     Ok(phones)
 }
+
+/// Check if --stealth flag is present in args, and enable stealth mode on the client.
+pub fn apply_stealth_flag(client: &WhatsAppClient) {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--stealth" || a == "-s") {
+        client.set_stealth(true);
+        eprintln!("🕵️ Stealth mode ACTIVE — invisible to contacts");
+        eprintln!("   • No read receipts (no blue ticks)");
+        eprintln!("   • No online presence (appear offline)");
+        eprintln!("   • No typing indicators");
+        eprintln!("   • Anonymous status viewing");
+    }
+}
