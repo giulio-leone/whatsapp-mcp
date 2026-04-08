@@ -31,6 +31,7 @@ pub enum WhatsAppEvent {
     Connected { jid: String },
     MessageReceived(Message),
     ReceiptReceived { id: String, from: String, timestamp: i64 },
+    PresenceUpdate { jid: String, available: bool, last_seen: Option<i64> },
     HistorySynced { chat_count: usize },
     Disconnected,
 }
@@ -340,6 +341,41 @@ impl WhatsAppClientPort for WhatsAppClient {
     async fn list_chats(&self) -> Result<Vec<Chat>> {
         let store = self.store.lock().await;
         Ok(store.chats.values().cloned().collect())
+    }
+}
+
+// ─── Presence Subscription ──────────────────────────────────────────
+
+impl WhatsAppClient {
+    /// Subscribe to presence updates for a list of JIDs.
+    /// The server will send `<presence>` stanzas when contacts go online/offline.
+    pub async fn subscribe_presence(&self, jids: &[String]) -> Result<()> {
+        for jid in jids {
+            let full_jid = if jid.contains('@') {
+                jid.clone()
+            } else {
+                format!("{}@s.whatsapp.net", jid)
+            };
+
+            let mut attrs = HashMap::new();
+            attrs.insert("to".to_string(), AttrValue::String(full_jid.clone()));
+            attrs.insert("type".to_string(), AttrValue::String("subscribe".to_string()));
+
+            let presence_node = Node::new("presence", attrs, Content::None);
+            self.send_node(&presence_node).await?;
+            tracing::info!("Subscribed to presence for {}", full_jid);
+        }
+        Ok(())
+    }
+
+    /// Send our own presence as available (required before receiving presence updates).
+    pub async fn send_available_presence(&self) -> Result<()> {
+        let mut attrs = HashMap::new();
+        attrs.insert("type".to_string(), AttrValue::String("available".to_string()));
+        let node = Node::new("presence", attrs, Content::None);
+        self.send_node(&node).await?;
+        tracing::info!("Sent own presence: available");
+        Ok(())
     }
 }
 
@@ -1233,6 +1269,19 @@ impl WhatsAppClient {
                                     if notif_type == "encrypt" || notif_type == "w:gp2" || notif_type == "server_sync" {
                                         Self::process_notification(&node, &store, &event_tx).await;
                                     }
+                                }
+                                "presence" => {
+                                    let from = node.get_attr("from").unwrap_or("").to_string();
+                                    let ptype = node.get_attr("type").unwrap_or("available");
+                                    let available = ptype != "unavailable";
+                                    let last_seen = node.get_attr("last")
+                                        .and_then(|v| v.parse::<i64>().ok());
+                                    tracing::info!("Presence: {} is {} (last_seen: {:?})", from, ptype, last_seen);
+                                    let _ = event_tx.send(WhatsAppEvent::PresenceUpdate {
+                                        jid: from,
+                                        available,
+                                        last_seen,
+                                    });
                                 }
                                 _ => {
                                     tracing::debug!("Received unhandled node: {}", node.tag);

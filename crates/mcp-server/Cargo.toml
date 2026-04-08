@@ -20,6 +20,14 @@ path = "src/bin/wa_send.rs"
 name = "wa-mcp-bridge"
 path = "src/bin/wa_mcp_bridge.rs"
 
+[[bin]]
+name = "wa-broadcast"
+path = "src/bin/wa_broadcast.rs"
+
+[[bin]]
+name = "wa-track"
+path = "src/bin/wa_track.rs"
+
 [dependencies]
 wa-domain = { path = "../domain" }
 wa-client = { path = "../wa-client" }
