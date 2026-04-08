@@ -167,19 +167,27 @@ impl WhatsAppClientPort for WhatsAppClient {
         let jid = chat_id.0.clone();
         tracing::info!("Sending message to {}", jid);
 
+        let is_broadcast = jid.contains("@broadcast");
         let user_part = jid.split('@').next().unwrap_or(&jid);
 
-        // 1. Discover recipient devices via usync (falls back to device 0)
-        let recipient_devices = self.discover_devices(user_part).await;
-        tracing::info!("Recipient devices for {}: {:?}", user_part, recipient_devices);
-
-        // 2. Discover our own devices for fanout (exclude self)
+        // Our own JID info (needed for fanout + msg ID)
         let our_jid_full = self.store.lock().await.our_jid.clone().unwrap_or_default();
         let our_user = our_jid_full.split(':').next().unwrap_or("").split('@').next().unwrap_or("");
         let our_device_id: u16 = our_jid_full.split(':').nth(1)
             .and_then(|s| s.split('@').next())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+
+        // 1. Discover recipient devices via usync (skip for broadcast JIDs)
+        let recipient_devices = if is_broadcast {
+            tracing::info!("Broadcast JID — skipping recipient device discovery");
+            vec![]
+        } else {
+            self.discover_devices(user_part).await
+        };
+        tracing::info!("Recipient devices for {}: {:?}", user_part, recipient_devices);
+
+        // 2. Discover our own devices for fanout (exclude self)
         let own_devices = if !our_user.is_empty() {
             self.discover_devices(our_user).await
                 .into_iter()
@@ -245,30 +253,31 @@ impl WhatsAppClientPort for WhatsAppClient {
             }
         }
 
-        if to_nodes.is_empty() {
-            return Err(anyhow!("Failed to encrypt for any recipient device"));
-        }
-
-        // 6. Encrypt for own devices (fanout with DeviceSentMessage wrapper)
+        // 6. Encrypt for own devices (fanout)
+        // For broadcast: use raw message; for DM: wrap in DeviceSentMessage
         if !own_devices.is_empty() {
-            let dsm = e2e::Message {
-                device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
-                    destination_jid: Some(jid.clone()),
-                    message: Some(Box::new(e2e::Message {
-                        conversation: Some(text.to_string()),
+            let own_padded = if is_broadcast {
+                padded.clone()
+            } else {
+                let dsm = e2e::Message {
+                    device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
+                        destination_jid: Some(jid.clone()),
+                        message: Some(Box::new(e2e::Message {
+                            conversation: Some(text.to_string()),
+                            ..Default::default()
+                        })),
                         ..Default::default()
                     })),
                     ..Default::default()
-                })),
-                ..Default::default()
+                };
+                let mut dsm_bytes = Vec::new();
+                dsm.encode(&mut dsm_bytes)?;
+                Self::pad_message(&dsm_bytes)
             };
-            let mut dsm_bytes = Vec::new();
-            dsm.encode(&mut dsm_bytes)?;
-            let dsm_padded = Self::pad_message(&dsm_bytes);
 
             for device_id in &own_devices {
                 let device_jid = format!("{}:{}@s.whatsapp.net", our_user, device_id);
-                match self.encrypt_for_device(&device_jid, &dsm_padded).await {
+                match self.encrypt_for_device(&device_jid, &own_padded).await {
                     Ok((enc_type, envelope, session)) => {
                         if enc_type == "pkmsg" { any_pkmsg = true; }
 
@@ -290,6 +299,11 @@ impl WhatsAppClientPort for WhatsAppClient {
                     }
                 }
             }
+        }
+
+        // Check after both recipient + own device encryption
+        if to_nodes.is_empty() {
+            return Err(anyhow!("Failed to encrypt for any device (recipient + own)"));
         }
 
         // 7. Build message node
@@ -489,6 +503,7 @@ impl WhatsAppClient {
 
         let mut iq_attrs = HashMap::new();
         iq_attrs.insert("id".to_string(), AttrValue::String(id));
+        iq_attrs.insert("to".to_string(), AttrValue::String("s.whatsapp.net".to_string()));
         iq_attrs.insert("type".to_string(), AttrValue::String("set".to_string()));
         iq_attrs.insert("xmlns".to_string(), AttrValue::String("w:m".to_string()));
 
@@ -538,6 +553,15 @@ impl WhatsAppClient {
         let jid = chat_id.0.clone();
         let full_jid = if jid.contains('@') { jid.clone() } else { format!("{}@s.whatsapp.net", jid) };
         let user_part = full_jid.split('@').next().unwrap_or(&full_jid);
+        let is_broadcast = jid.contains("@broadcast");
+
+        // Our own JID info (needed for fanout)
+        let our_jid_full = self.store.lock().await.our_jid.clone().unwrap_or_default();
+        let our_user = our_jid_full.split(':').next().unwrap_or("").split('@').next().unwrap_or("");
+        let our_device_id: u16 = our_jid_full.split(':').nth(1)
+            .and_then(|s| s.split('@').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         tracing::info!("Sending image ({} bytes, {}) to {}", image_bytes.len(), mime, full_jid);
 
@@ -595,11 +619,28 @@ impl WhatsAppClient {
         msg.encode(&mut e2e_bytes)?;
         let padded = Self::pad_message(&e2e_bytes);
 
-        // 5. Multi-device encrypt + send (same as send_message)
-        let recipient_devices = self.discover_devices(user_part).await;
+        // 5. Multi-device encrypt + send (broadcast-aware, same as send_message)
+        let recipient_devices = if is_broadcast {
+            tracing::info!("Broadcast JID — skipping recipient device discovery for image");
+            vec![]
+        } else {
+            self.discover_devices(user_part).await
+        };
+
+        let own_devices = if !our_user.is_empty() {
+            self.discover_devices(our_user).await
+                .into_iter()
+                .filter(|&d| d != our_device_id)
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        tracing::info!("Image send — recipient devices: {:?}, own devices (excl {}): {:?}", recipient_devices, our_device_id, own_devices);
+
         let mut to_nodes = Vec::new();
         let mut sessions_to_persist: Vec<(String, Vec<u8>)> = Vec::new();
 
+        // Encrypt for recipient devices
         for device_id in &recipient_devices {
             let device_jid = format!("{}:{}@s.whatsapp.net", user_part, device_id);
             match self.encrypt_for_device(&device_jid, &padded).await {
@@ -618,6 +659,47 @@ impl WhatsAppClient {
                     sessions_to_persist.push((device_jid, session_bytes));
                 }
                 Err(e) => tracing::warn!("Failed to encrypt image for {}: {}", device_jid, e),
+            }
+        }
+
+        // Encrypt for own devices (fanout)
+        if !own_devices.is_empty() {
+            let own_padded = if is_broadcast {
+                padded.clone()
+            } else {
+                // Wrap in DeviceSentMessage for DM
+                let dsm = e2e::Message {
+                    device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
+                        destination_jid: Some(jid.clone()),
+                        message: Some(Box::new(msg.clone())),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let mut dsm_bytes = Vec::new();
+                dsm.encode(&mut dsm_bytes)?;
+                Self::pad_message(&dsm_bytes)
+            };
+
+            for device_id in &own_devices {
+                let device_jid = format!("{}:{}@s.whatsapp.net", our_user, device_id);
+                match self.encrypt_for_device(&device_jid, &own_padded).await {
+                    Ok((enc_type, envelope, session)) => {
+                        let mut enc_attrs = HashMap::new();
+                        enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
+                        enc_attrs.insert("type".to_string(), AttrValue::String(enc_type));
+                        let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
+
+                        let mut to_attrs = HashMap::new();
+                        to_attrs.insert("jid".to_string(), AttrValue::String(device_jid.clone()));
+                        let to_node = Node::new("to", to_attrs, Content::Nodes(vec![enc_node]));
+                        to_nodes.push(to_node);
+
+                        let session_bytes = serde_json::to_vec(&session)?;
+                        sessions_to_persist.push((device_jid, session_bytes));
+                    }
+                    Err(e) => tracing::warn!("Failed to encrypt image for own device {}: {}", device_jid, e),
+                }
             }
         }
 
