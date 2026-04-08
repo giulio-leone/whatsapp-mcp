@@ -6,6 +6,7 @@ pub struct USyncRequest {
     pub query_contact: bool,
     pub query_devices: bool,
     pub query_status: bool,
+    pub context: String, // "interactive" or "message"
 }
 
 impl USyncRequest {
@@ -15,6 +16,18 @@ impl USyncRequest {
             query_contact: true,
             query_devices: true,
             query_status: false,
+            context: "interactive".to_string(),
+        }
+    }
+
+    /// Create a usync request specifically for message device discovery.
+    pub fn for_message(users: Vec<String>) -> Self {
+        Self {
+            users,
+            query_contact: false,
+            query_devices: true,
+            query_status: false,
+            context: "message".to_string(),
         }
     }
 
@@ -30,7 +43,7 @@ impl USyncRequest {
         usync_attrs.insert("mode".to_string(), AttrValue::String("query".to_string()));
         usync_attrs.insert("last".to_string(), AttrValue::String("true".to_string()));
         usync_attrs.insert("index".to_string(), AttrValue::String("0".to_string()));
-        usync_attrs.insert("context".to_string(), AttrValue::String("interactive".to_string()));
+        usync_attrs.insert("context".to_string(), AttrValue::String(self.context.clone()));
 
         let mut query_children = Vec::new();
         if self.query_contact {
