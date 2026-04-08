@@ -58,9 +58,9 @@ impl QrRef {
 
     /// Render QR code as terminal-friendly Unicode block art.
     pub fn render_terminal(data: &str) -> String {
-        // Simple terminal representation — each module is a block character
-        use qrcode::QrCode;
-        let code = match QrCode::new(data.as_bytes()) {
+        use qrcode::{QrCode, EcLevel};
+        // Use Low ECC for smallest possible QR — fits better in narrow terminals
+        let code = match QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L) {
             Ok(c) => c,
             Err(e) => return format!("QR encode error: {}", e),
         };

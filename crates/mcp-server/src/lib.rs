@@ -15,6 +15,7 @@
 //! 5. **Structured Responses**: Rich context metadata in every response
 //!    (timestamps in ISO 8601, sender names resolved, reply context inlined).
 
+pub mod bridge;
 pub mod protocol;
 pub mod tools;
 pub mod server;

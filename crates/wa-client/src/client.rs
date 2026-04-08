@@ -6,7 +6,6 @@ use crate::binary::tokens::WA_CONN_HEADER;
 use crate::store::DeviceStore;
 use crate::binary::node::{Node, AttrValue, Content};
 use crate::binary::{Encoder, Decoder};
-use crate::qr::QrRef;
 use x25519_dalek::{StaticSecret, PublicKey};
 use prost::Message as ProstMessage;
 use anyhow::{Result, anyhow, Context};
@@ -26,6 +25,9 @@ use crate::crypto::session::Session;
 #[derive(Debug)]
 pub enum WhatsAppEvent {
     QrCode(String),
+    /// Pairing succeeded — session saved but client must reconnect with login payload
+    PairSuccess { jid: String },
+    /// Fully connected and ready to send/receive messages
     Connected { jid: String },
     MessageReceived(Message),
     ReceiptReceived { id: String, from: String, timestamp: i64 },
@@ -45,6 +47,7 @@ pub enum ConnectionState {
 
 // ─── Client ─────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct WhatsAppClient {
     inner: Arc<Mutex<WhatsAppClientInner>>,
     pub store: Arc<Mutex<DeviceStore>>,
@@ -162,13 +165,32 @@ impl WhatsAppClientPort for WhatsAppClient {
         let jid = chat_id.0.clone();
         tracing::info!("Sending message to {}", jid);
 
-        // 1. Get or create Signal session
-        let mut session = self.get_or_create_session(&jid).await?;
+        // 1. Determine device JID (phone = user:0 for now)
+        let user_part = jid.split('@').next().unwrap_or(&jid);
+        let device_jid = format!("{}:0@s.whatsapp.net", user_part);
 
-        let msg_id = format!("{:x}", rand::random::<u64>());
+        // 2. Get or create Signal session for the device
+        let mut session = self.get_or_create_session(&device_jid).await?;
+
+        // Generate message ID matching whatsmeow format: "3EB0" + 18 hex chars (SHA256 of timestamp+ownJID+random)
+        let msg_id = {
+            use sha2::{Sha256, Digest};
+            let now = chrono::Utc::now().timestamp() as u64;
+            let own_jid = {
+                let s = self.store.lock().await;
+                s.our_jid.clone().unwrap_or_default()
+            };
+            let random_bytes: [u8; 16] = rand::random();
+            let mut hasher = Sha256::new();
+            hasher.update(now.to_be_bytes());
+            hasher.update(own_jid.as_bytes());
+            hasher.update(&random_bytes);
+            let hash = hasher.finalize();
+            format!("3EB0{}", hex::encode(&hash[..9]).to_uppercase())
+        };
         let timestamp = chrono::Utc::now().timestamp();
 
-        // 2. Build E2E Message protobuf
+        // 3. Build E2E Message protobuf
         use crate::proto::wa_web_protobufs_e2e as e2e;
         let e2e_msg = e2e::Message {
             conversation: Some(text.to_string()),
@@ -177,56 +199,140 @@ impl WhatsAppClientPort for WhatsAppClient {
         let mut e2e_bytes = Vec::new();
         e2e_msg.encode(&mut e2e_bytes)?;
 
-        // 3. Encrypt with full Double Ratchet
-        let (ciphertext, ratchet_pub, counter, prev_counter) = session.encrypt(&e2e_bytes)?;
+        // 4. Pad message (WhatsApp padding: N copies of byte N, where N = random 1..16)
+        // This matches whatsmeow's padMessage format
+        let pad_value = {
+            let r = rand::random::<u8>() & 0x0F; // 0-15
+            if r == 0 { 16u8 } else { r }
+        };
+        let mut padded = Vec::with_capacity(e2e_bytes.len() + pad_value as usize);
+        padded.extend_from_slice(&e2e_bytes);
+        for _ in 0..pad_value {
+            padded.push(pad_value);
+        }
 
-        // 4. Build MAC (HMAC-SHA256 truncated to 10 bytes)
-        let mac = crate::crypto::compute_mac(
-            &session.ratchet.root_key.key, // Use a derived key; simplified
-            &ciphertext,
-        );
+        // 5. Encrypt with Double Ratchet
+        let (ciphertext, ratchet_pub, counter, prev_counter, msg_keys) = session.encrypt(&padded)?;
 
-        // 5. Build Signal envelope
+        // 6. Build inner SignalMessage protobuf
+        // Keys in Signal proto use 33-byte format: 0x05 prefix + 32 raw bytes
+        let mut ratchet_key_33 = Vec::with_capacity(33);
+        ratchet_key_33.push(0x05);
+        ratchet_key_33.extend_from_slice(&ratchet_pub);
+
         let signal_msg = crate::proto::signal::SignalMessage {
-            ratcheting_key: ratchet_pub.to_vec(),
-            counter,
-            previous_counter: prev_counter,
-            ciphertext: ciphertext.clone(),
+            ratcheting_key: Some(ratchet_key_33),
+            counter: Some(counter),
+            previous_counter: Some(prev_counter),
+            ciphertext: Some(ciphertext.clone()),
         };
-        let mut signal_bytes = Vec::new();
-        signal_msg.encode(&mut signal_bytes)?;
+        let mut signal_proto_bytes = Vec::new();
+        signal_msg.encode(&mut signal_proto_bytes)?;
 
-        // 6. Version byte + serialized message + truncated MAC
-        let mut envelope = Vec::with_capacity(1 + signal_bytes.len() + 10);
-        let version_byte = match &session.pending_prekey {
-            Some(_) => 0x33, // PreKeySignalMessage: version 3, type 3
-            None => 0x32,    // SignalMessage: version 3, type 2
+        // 7. Compute SignalMessage MAC
+        // MAC = HMAC-SHA256(mac_key, sender_identity_33 || receiver_identity_33 || version_byte || proto_bytes)
+        // Truncated to 8 bytes
+        let version_byte: u8 = 0x33; // Signal v3
+        let (our_identity_33, remote_identity_33, registration_id) = {
+            let store = self.store.lock().await;
+            let mut our_id = Vec::with_capacity(33);
+            our_id.push(0x05);
+            our_id.extend_from_slice(&store.identity_key_pub);
+            let mut remote_id = Vec::with_capacity(33);
+            remote_id.push(0x05);
+            remote_id.extend_from_slice(&session.remote_identity_key);
+            (our_id, remote_id, store.registration_id)
         };
-        envelope.push(version_byte);
-        envelope.extend_from_slice(&signal_bytes);
-        envelope.extend_from_slice(&mac[..10]);
 
-        // 7. Build WAP message node
+        let mut mac_data = Vec::new();
+        mac_data.extend_from_slice(&our_identity_33);
+        mac_data.extend_from_slice(&remote_identity_33);
+        mac_data.push(version_byte);
+        mac_data.extend_from_slice(&signal_proto_bytes);
+        let mac = crate::crypto::compute_mac(&msg_keys.mac_key, &mac_data);
+
+        // 8. Build serialized inner SignalMessage: version_byte || proto || mac[0:8]
+        let mut inner_signal_serialized = Vec::with_capacity(1 + signal_proto_bytes.len() + 8);
+        inner_signal_serialized.push(version_byte);
+        inner_signal_serialized.extend_from_slice(&signal_proto_bytes);
+        inner_signal_serialized.extend_from_slice(&mac[..8]);
+
+        // 9. Build final envelope
+        let enc_type;
+        let envelope = if let Some(ref pk) = session.pending_prekey {
+            // PreKeySignalMessage: wraps inner SignalMessage in PreKeySignalMessage protobuf
+            enc_type = "pkmsg";
+
+            let mut base_key_33 = Vec::with_capacity(33);
+            base_key_33.push(0x05);
+            base_key_33.extend_from_slice(&pk.base_key);
+
+            let pkmsg = crate::proto::signal::PreKeySignalMessage {
+                registration_id: Some(registration_id),
+                pre_key_id: Some(pk.prekey_id),
+                signed_pre_key_id: Some(pk.signed_prekey_id),
+                base_key: Some(base_key_33),
+                identity_key: Some(our_identity_33.clone()),
+                message: Some(inner_signal_serialized),
+            };
+            let mut pkmsg_proto_bytes = Vec::new();
+            pkmsg.encode(&mut pkmsg_proto_bytes)?;
+
+            // PreKeySignalMessage envelope: version_byte || proto (NO outer MAC)
+            let mut env = Vec::with_capacity(1 + pkmsg_proto_bytes.len());
+            env.push(version_byte);
+            env.extend_from_slice(&pkmsg_proto_bytes);
+            env
+        } else {
+            // Regular SignalMessage — already assembled
+            enc_type = "msg";
+            inner_signal_serialized
+        };
+
+        tracing::info!("Envelope: type={}, len={}, pending_prekey={}", enc_type, envelope.len(), session.pending_prekey.is_some());
+        tracing::info!("Envelope hex (first 64 bytes): {}", hex::encode(&envelope[..std::cmp::min(64, envelope.len())]));
+        tracing::info!("Registration ID: {}, Counter: {}, PrevCounter: {}", registration_id, counter, prev_counter);
+        tracing::info!("Ratchet pub (our): {}", hex::encode(&ratchet_pub));
+        tracing::info!("E2E plaintext len: {}, padded len: {}, ciphertext len: {}", e2e_bytes.len(), padded.len(), ciphertext.len());
+        if let Some(ref pk) = session.pending_prekey {
+            tracing::info!("PendingPreKey: prekey_id={}, skey_id={}, base_key={}", pk.prekey_id, pk.signed_prekey_id, hex::encode(&pk.base_key));
+        }
+
+        // 10. Build WAP message node with multi-device <participants><to> structure
+        let mut enc_attrs = HashMap::new();
+        enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
+        enc_attrs.insert("type".to_string(), AttrValue::String(enc_type.to_string()));
+        let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
+
+        let mut to_attrs = HashMap::new();
+        to_attrs.insert("jid".to_string(), AttrValue::String(device_jid.clone()));
+        let to_node = Node::new("to", to_attrs, Content::Nodes(vec![enc_node]));
+
+        let participants_node = Node::new("participants", HashMap::new(), Content::Nodes(vec![to_node]));
+
+        // Build message children: participants + device-identity (required when sending pkmsg)
+        let mut msg_children = vec![participants_node];
+        if enc_type == "pkmsg" {
+            let store = self.store.lock().await;
+            if let Some(ref account_bytes) = store.account_identity {
+                msg_children.push(Node::new("device-identity", HashMap::new(), Content::Bytes(account_bytes.clone())));
+                tracing::info!("Including device-identity node ({} bytes) for pkmsg", account_bytes.len());
+            } else {
+                tracing::warn!("No account_identity stored — device-identity node will be missing from pkmsg!");
+            }
+        }
+
         let mut msg_attrs = HashMap::new();
         msg_attrs.insert("id".to_string(), AttrValue::String(msg_id.clone()));
         msg_attrs.insert("to".to_string(), AttrValue::String(jid.clone()));
         msg_attrs.insert("type".to_string(), AttrValue::String("text".to_string()));
-
-        let enc_type = if session.pending_prekey.is_some() { "pkmsg" } else { "msg" };
-        let mut enc_attrs = HashMap::new();
-        enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
-        enc_attrs.insert("type".to_string(), AttrValue::String(enc_type.to_string()));
-
-        let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
-        let message_node = Node::new("message", msg_attrs, Content::Nodes(vec![enc_node]));
+        let message_node = Node::new("message", msg_attrs, Content::Nodes(msg_children));
 
         self.send_node(&message_node).await?;
 
-        // 8. Persist updated session
+        // 11. Persist updated session
         let session_bytes = serde_json::to_vec(&session)?;
-        self.store.lock().await.save_session(jid.clone(), session_bytes);
-
-        // 9. Persist store
+        self.store.lock().await.save_session(device_jid, session_bytes);
         let _ = self.persist_store().await;
 
         Ok(Message {
@@ -256,15 +362,14 @@ impl WhatsAppClient {
         inner.noise = NoiseHandshake::new();
         inner.msg_counter = 0;
 
-        let mut fs = FrameSocket::connect().await?;
+        let mut fs = FrameSocket::connect(WA_CONN_HEADER).await?;
 
         let ephemeral_priv = StaticSecret::random_from_rng(rand::thread_rng());
         let ephemeral_pub = PublicKey::from(&ephemeral_priv);
 
         inner.noise.start(NOISE_MODE, WA_CONN_HEADER)?;
 
-        // Send connection header
-        fs.send_frame(WA_CONN_HEADER).await?;
+        // Connection header is automatically sent by FrameSocket on the first frame
 
         let client_hello = HandshakeMessage {
             client_hello: Some(ClientHello {
@@ -308,13 +413,11 @@ impl WhatsAppClient {
         let is_new_login = store.our_jid.is_none();
         drop(store);
 
+        // NOTE: QR codes are NOT generated here.
+        // The server sends `pair-device` IQs with ref codes AFTER the handshake.
+        // The read_loop handler generates QR codes from those server-provided refs.
         if is_new_login {
             *self.state.lock().await = ConnectionState::WaitingForQr;
-            let qr_ref = QrRef::generate();
-            let store = self.store.lock().await;
-            let qr_data = qr_ref.encode(&store.noise_key.pub_key, &store.identity_key_pub);
-            drop(store);
-            let _ = inner.event_tx.send(WhatsAppEvent::QrCode(qr_data));
         }
 
         let (pub_key_bytes, priv_key_bytes) = {
@@ -324,15 +427,29 @@ impl WhatsAppClient {
         let encrypted_pubkey = inner.noise.encrypt(&pub_key_bytes)?;
         inner.noise.mix_shared_secret_into_key(&priv_key_bytes, &server_ephemeral_arr)?;
 
-        let client_payload = ClientPayload {
+        // Version must match whatsmeow: {2, 3000, 1035920091}
+        let mut client_payload = ClientPayload {
+            username: None, // Only set for login (not registration) — whatsmeow: getLoginPayload only
+            passive: Some(false),
+            pull: Some(false),
+            shards: vec![], // whatsmeow never sets shards
             user_agent: Some(crate::proto::wa_web_protobufs_wa6::client_payload::UserAgent {
                 platform: Some(crate::proto::wa_web_protobufs_wa6::client_payload::user_agent::Platform::Web.into()),
+                release_channel: Some(crate::proto::wa_web_protobufs_wa6::client_payload::user_agent::ReleaseChannel::Release.into()),
                 app_version: Some(crate::proto::wa_web_protobufs_wa6::client_payload::user_agent::AppVersion {
                     primary: Some(2),
-                    secondary: Some(2411),
-                    tertiary: Some(2),
+                    secondary: Some(3000),
+                    tertiary: Some(1035920091),
                     ..Default::default()
                 }),
+                mcc: Some("000".to_string()),
+                mnc: Some("000".to_string()),
+                os_version: Some("0.1".to_string()),
+                manufacturer: Some(String::new()),
+                device: Some("Desktop".to_string()),
+                os_build_number: Some("0.1".to_string()),
+                locale_language_iso6391: Some("en".to_string()),
+                locale_country_iso31661_alpha2: Some("US".to_string()),
                 ..Default::default()
             }),
             web_info: Some(crate::proto::wa_web_protobufs_wa6::client_payload::WebInfo {
@@ -341,10 +458,99 @@ impl WhatsAppClient {
             }),
             connect_type: Some(crate::proto::wa_web_protobufs_wa6::client_payload::ConnectType::WifiUnknown.into()),
             connect_reason: Some(crate::proto::wa_web_protobufs_wa6::client_payload::ConnectReason::UserActivated.into()),
-            push_name: Some("WhatsApp MCP".to_string()),
             ..Default::default()
         };
 
+        if is_new_login {
+            let store = self.store.lock().await;
+            let mut reg_id_bytes = [0u8; 4];
+            reg_id_bytes.copy_from_slice(&store.registration_id.to_be_bytes());
+
+            let mut skey_id_bytes = [0u8; 4];
+            skey_id_bytes.copy_from_slice(&store.signed_prekey.key_id.to_be_bytes());
+
+            let device_props = crate::proto::wa_companion_reg::DeviceProps {
+                os: Some("whatsmeow".to_string()),
+                version: Some(crate::proto::wa_companion_reg::device_props::AppVersion {
+                    primary: Some(0),
+                    secondary: Some(1),
+                    tertiary: Some(0),
+                    ..Default::default()
+                }),
+                platform_type: Some(crate::proto::wa_companion_reg::device_props::PlatformType::Unknown.into()),
+                require_full_sync: Some(false),
+                history_sync_config: Some(crate::proto::wa_companion_reg::device_props::HistorySyncConfig {
+                    full_sync_days_limit: None,
+                    full_sync_size_mb_limit: None,
+                    storage_quota_mb: Some(10240),
+                    inline_initial_payload_in_e2_ee_msg: Some(true),
+                    recent_sync_days_limit: None,
+                    support_call_log_history: Some(false),
+                    support_bot_user_agent_chat_history: Some(true),
+                    support_cag_reactions_and_polls: Some(true),
+                    support_biz_hosted_msg: Some(true),
+                    support_recent_sync_chunk_message_count_tuning: Some(true),
+                    support_hosted_group_msg: Some(true),
+                    support_fbid_bot_chat_history: Some(true),
+                    support_add_on_history_sync_migration: None,
+                    support_message_association: Some(true),
+                    support_group_history: Some(true),
+                    on_demand_ready: None,
+                    support_guest_chat: None,
+                    complete_on_demand_ready: None,
+                    thumbnail_sync_days_limit: Some(60),
+                    initial_sync_max_messages_per_chat: None,
+                    support_manus_history: Some(true),
+                    support_hatch_history: Some(true),
+                }),
+                ..Default::default()
+            };
+
+            use prost::Message;
+            let device_props_bytes = device_props.encode_to_vec();
+
+            // BuildHash = md5("2.3000.1035920091")
+            client_payload.device_pairing_data = Some(crate::proto::wa_web_protobufs_wa6::client_payload::DevicePairingRegistrationData {
+                e_regid: Some(reg_id_bytes.to_vec()),
+                e_keytype: Some(vec![5]),
+                e_ident: Some(store.identity_key_pub.to_vec()),
+                e_skey_id: Some(skey_id_bytes[1..].to_vec()),
+                e_skey_val: Some(store.signed_prekey.pub_key.to_vec()),
+                e_skey_sig: Some(store.signed_prekey.signature.clone()),
+                build_hash: Some(vec![211, 73, 16, 53, 118, 193, 129, 58, 170, 79, 121, 172, 64, 243, 83, 192]),
+                device_props: Some(device_props_bytes),
+                ..Default::default()
+            });
+
+        } else {
+            // Login path — reconnect with saved credentials (whatsmeow: getLoginPayload)
+            let store = self.store.lock().await;
+            if let Some(ref jid_str) = store.our_jid {
+                // Parse JID: "393793667569:3@s.whatsapp.net" → user=393793667569, device=3
+                let jid_without_server = jid_str.split('@').next().unwrap_or("");
+                let parts: Vec<&str> = jid_without_server.split(':').collect();
+                if let Some(user_str) = parts.first() {
+                    if let Ok(user_id) = user_str.parse::<u64>() {
+                        client_payload.username = Some(user_id);
+                    }
+                }
+                if let Some(device_str) = parts.get(1) {
+                    if let Ok(device_id) = device_str.parse::<u32>() {
+                        client_payload.device = Some(device_id);
+                    }
+                }
+            }
+            client_payload.passive = Some(true);
+            client_payload.pull = Some(true);
+            client_payload.lid_db_migrated = Some(true);
+            if client_payload.lc.is_none() {
+                client_payload.lc = Some(1);
+            }
+            tracing::info!("Login payload: username={:?}, device={:?}, passive=true, pull=true",
+                client_payload.username, client_payload.device);
+        }
+
+        use prost::Message;
         let payload_bytes = client_payload.encode_to_vec();
         let encrypted_payload = inner.noise.encrypt(&payload_bytes)?;
 
@@ -365,149 +571,493 @@ impl WhatsAppClient {
         let (tx, rx) = fs.split()?;
 
         let sender = NoiseSender { tx, write_cipher, write_counter: 0 };
-        let receiver = NoiseReceiver { rx, read_cipher, read_counter: 0 };
+        let receiver = NoiseReceiver::new(rx, read_cipher);
 
         inner.sender = Some(sender);
 
-        let iq_mutex = inner.iq_tracker.clone();
-        let event_tx = inner.event_tx.clone();
-        let store_ref = self.store.clone();
-        let state_ref = self.state.clone();
-        let db_path = self.db_path.clone();
-
+        let client_clone = self.clone();
         tokio::spawn(async move {
-            Self::read_loop(receiver, iq_mutex, event_tx, store_ref, state_ref, db_path).await;
+            client_clone.read_loop(receiver).await;
         });
 
         Ok(())
     }
 
-    async fn read_loop(
-        mut receiver: NoiseReceiver,
-        iq_tracker: Arc<Mutex<HashMap<String, oneshot::Sender<Node>>>>,
-        event_tx: tokio::sync::mpsc::UnboundedSender<WhatsAppEvent>,
-        store: Arc<Mutex<DeviceStore>>,
-        state: Arc<Mutex<ConnectionState>>,
-        db_path: String,
-    ) {
+    /// Handle the pair-success IQ from the server.
+    ///
+    /// This implements the whatsmeow `handlePairSuccess` + `handlePair` flow:
+    /// 1. Verify HMAC on the device identity container
+    /// 2. Verify the account signature
+    /// 3. Generate the device signature
+    /// 4. Send the pairing confirmation IQ
+    /// 5. Save the JID to the store
+    async fn handle_pair_success(
+        di_bytes: &[u8],
+        iq_id: &str,
+        jid: &str,
+        store: &Arc<Mutex<DeviceStore>>,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<WhatsAppEvent>,
+        client: &WhatsAppClient,
+    ) -> Result<()> {
+        use crate::proto::wa_adv::{AdvSignedDeviceIdentityHmac, AdvSignedDeviceIdentity, AdvDeviceIdentity};
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        // 1. Parse the HMAC container
+        let container = AdvSignedDeviceIdentityHmac::decode(di_bytes)
+            .map_err(|e| anyhow!("Failed to parse ADVSignedDeviceIdentityHMAC: {}", e))?;
+        let details_raw = container.details.ok_or_else(|| anyhow!("Missing details in HMAC container"))?;
+        let hmac_value = container.hmac.ok_or_else(|| anyhow!("Missing HMAC in container"))?;
+
+        // 2. Verify HMAC using the ADV secret key
+        let adv_secret = {
+            let s = store.lock().await;
+            s.adv_secret.0
+        };
+
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&adv_secret)
+            .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
+        mac.update(&details_raw);
+        mac.verify_slice(&hmac_value)
+            .map_err(|_| anyhow!("HMAC verification failed — adv_secret mismatch"))?;
+
+        tracing::info!("HMAC verification passed");
+
+        // 3. Parse the signed device identity
+        let mut device_identity = AdvSignedDeviceIdentity::decode(&details_raw[..])
+            .map_err(|e| anyhow!("Failed to parse ADVSignedDeviceIdentity: {}", e))?;
+        let identity_details_raw = device_identity.details.as_ref()
+            .ok_or_else(|| anyhow!("Missing details in signed identity"))?
+            .clone();
+
+        // 4. Parse device identity details
+        let device_identity_details = AdvDeviceIdentity::decode(&identity_details_raw[..])
+            .map_err(|e| anyhow!("Failed to parse ADVDeviceIdentity: {}", e))?;
+
+        tracing::info!("Device identity parsed: key_index={:?}", device_identity_details.key_index);
+
+        // 5. Verify account signature
+        let account_sig_key = device_identity.account_signature_key.as_ref()
+            .ok_or_else(|| anyhow!("Missing account signature key"))?;
+        let account_sig = device_identity.account_signature.as_ref()
+            .ok_or_else(|| anyhow!("Missing account signature"))?;
+
+        if account_sig_key.len() != 32 || account_sig.len() != 64 {
+            return Err(anyhow!("Invalid signature key/signature length"));
+        }
+
+        let identity_key_pub = {
+            let s = store.lock().await;
+            s.identity_key_pub
+        };
+
+        // Verify: sign(accountSignatureKey, [6,0] + details + identityKeyPub)
+        // accountSignatureKey is a Curve25519 key — must use XEdDSA (not plain ed25519)
+        let mut verify_msg = vec![6u8, 0u8];
+        verify_msg.extend_from_slice(&identity_details_raw);
+        verify_msg.extend_from_slice(&identity_key_pub);
+
+        let sig_key_arr: [u8; 32] = account_sig_key[..32].try_into()?;
+        let sig_arr: [u8; 64] = account_sig[..64].try_into()?;
+
+        if !crate::crypto::xeddsa::xeddsa_verify(&sig_key_arr, &verify_msg, &sig_arr) {
+            return Err(anyhow!("Account signature verification failed (XEdDSA)"));
+        }
+
+        tracing::info!("Account signature verified");
+
+        // 6. Generate device signature
+        let identity_key_priv = {
+            let s = store.lock().await;
+            s.identity_key_priv
+        };
+
+        let mut sign_msg = vec![6u8, 1u8];
+        sign_msg.extend_from_slice(&identity_details_raw);
+        sign_msg.extend_from_slice(&identity_key_pub);
+        sign_msg.extend_from_slice(account_sig_key);
+
+        // Sign using XEdDSA (NOT plain ed25519) — identity_key_priv is a Curve25519 key
+        let device_sig = crate::crypto::xeddsa::xeddsa_sign(&identity_key_priv, &sign_msg);
+        device_identity.device_signature = Some(device_sig.to_vec());
+
+        // 7. Strip account_signature_key before sending back
+        let account_sig_key_copy = device_identity.account_signature_key.take();
+        let self_signed_identity = device_identity.encode_to_vec();
+        device_identity.account_signature_key = account_sig_key_copy;
+
+        // 8. Save JID + account identity + emit Connected event
+        {
+            let mut s = store.lock().await;
+            s.our_jid = Some(jid.to_string());
+            // Store the full AdvSignedDeviceIdentity for device-identity node in pkmsg sends
+            s.account_identity = Some(device_identity.encode_to_vec());
+        }
+
+        // 9. Persist updated store (including account_identity) to SQLite
+        Self::persist_store_static(&store, &client.db_path).await;
+
+        // 10. Send pair-device-sign confirmation IQ
+        let key_index_val = device_identity_details.key_index.unwrap_or(0);
+        let confirm_node = Node::new(
+            "iq",
+            IntoIterator::into_iter([
+                ("to".to_string(), AttrValue::String("s.whatsapp.net".to_string())),
+                ("type".to_string(), AttrValue::String("result".to_string())),
+                ("id".to_string(), AttrValue::String(iq_id.to_string())),
+            ]).collect(),
+            Content::Nodes(vec![
+                Node::new("pair-device-sign", std::collections::HashMap::new(),
+                    Content::Nodes(vec![
+                        Node::new("device-identity", IntoIterator::into_iter([
+                            ("key-index".to_string(), AttrValue::String(key_index_val.to_string())),
+                        ]).collect(), Content::Bytes(self_signed_identity)),
+                    ]),
+                ),
+            ]),
+        );
+
+        client.send_node(&confirm_node).await?;
+        tracing::info!("Sent pair-device-sign confirmation IQ");
+
+        // Emit pair-success event (NOT Connected — must reconnect with login payload first)
+        let _ = event_tx.send(WhatsAppEvent::PairSuccess { jid: jid.to_string() });
+
+        Ok(())
+    }
+
+    async fn read_loop(self, mut receiver: NoiseReceiver) {
+        let iq_tracker = self.inner.lock().await.iq_tracker.clone();
+        let event_tx = self.inner.lock().await.event_tx.clone();
+        let store = self.store.clone();
+        let state = self.state.clone();
+        let db_path = self.db_path.clone();
+
         loop {
             match receiver.receive_encrypted_frame().await {
                 Ok(bytes) => {
-                    let mut decoder = Decoder::new(&bytes);
-                    if let Ok(node) = decoder.read_node() {
-                        tracing::debug!("Received node: tag={}, attrs={:?}", node.tag, node.attrs.keys().collect::<Vec<_>>());
-
-                        match node.tag.as_str() {
-                            "iq" => {
-                                if let Some(id) = node.get_attr("id") {
-                                    let mut tracker = iq_tracker.lock().await;
-                                    if let Some(tx) = tracker.remove(id) {
-                                        let _ = tx.send(node);
-                                    }
-                                }
+                    tracing::info!("read_loop: received {} decrypted bytes, flag=0x{:02x}", bytes.len(), bytes.get(0).copied().unwrap_or(0));
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let flag = bytes[0];
+                    let payload = &bytes[1..];
+                    let unpacked = if flag & 2 != 0 {
+                        // zlib decompress
+                        use std::io::Read;
+                        match flate2::read::ZlibDecoder::new(payload).bytes().collect::<Result<Vec<u8>, _>>() {
+                            Ok(decompressed) => {
+                                tracing::info!("read_loop: decompressed {} -> {} bytes", payload.len(), decompressed.len());
+                                decompressed
                             }
-                            "message" => {
-                                let id = node.get_attr("id").unwrap_or("unknown").to_string();
-                                let from = node.get_attr("from").unwrap_or("unknown").to_string();
-                                let participant = node.get_attr("participant").map(|s| s.to_string());
+                            Err(e) => {
+                                tracing::warn!("read_loop: zlib decompression failed: {}", e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        payload.to_vec()
+                    };
 
-                                // Determine actual sender for group messages
-                                let sender_jid = participant.as_deref().unwrap_or(&from);
+                    let mut decoder = Decoder::new(&unpacked);
+                    tracing::info!("read_loop: unpacked first bytes: {:02x?}", &unpacked[..std::cmp::min(20, unpacked.len())]);
+                    match decoder.read_node() {
+                        Ok(node) => {
+                            tracing::info!("Received node: tag={}, attrs={:?}", node.tag, node.attrs.keys().collect::<Vec<_>>());
 
-                                let text = if let Some(enc_node) = node.get_child_by_tag("enc") {
-                                    let enc_type = enc_node.get_attr("type").unwrap_or("");
-                                    match &enc_node.content {
-                                        Content::Bytes(cipher_bytes) => {
-                                            match Self::decrypt_message(cipher_bytes, enc_type, sender_jid, &from, &store).await {
-                                                Ok(plaintext) => {
-                                                    use crate::proto::wa_web_protobufs_e2e as e2e;
-                                                    if let Ok(e2e_msg) = e2e::Message::decode(&plaintext[..]) {
-                                                        e2e_msg.conversation.or_else(|| {
-                                                            e2e_msg.extended_text_message.and_then(|m| m.text)
-                                                        })
-                                                    } else {
-                                                        String::from_utf8(plaintext).ok()
+                            match node.tag.as_str() {
+                                "iq" => {
+                                    // Check for pair-device / pair-success IQs first
+                                    let from_jid = node.attrs.get("from").map(|val| {
+                                        match val {
+                                            AttrValue::String(s) => s.clone(),
+                                            AttrValue::Jid(j) => j.to_string(),
+                                            _ => String::new(),
+                                        }
+                                    }).unwrap_or_else(|| String::new());
+                                    let from = from_jid.as_str();
+
+                                    let iq_type = node.get_attr("type").unwrap_or("");
+                                    let first_child_tag = match &node.content {
+                                        Content::Nodes(children) if !children.is_empty() => {
+                                            children[0].tag.as_str().to_string()
+                                        }
+                                        _ => {
+                                            tracing::debug!("IQ content was not nodes: {:?}", node.content);
+                                            String::new()
+                                        }
+                                    };
+                                    tracing::info!("IQ received: from={}, type={}, first_child={}", from, iq_type, first_child_tag);
+
+                                    if from == "s.whatsapp.net" && first_child_tag == "pair-device" {
+                                        tracing::info!("Received pair-device IQ");
+                                        let iq_id = node.get_attr("id").unwrap_or("").to_string();
+
+                                        let ack_node = Node::new(
+                                            "iq",
+                                            IntoIterator::into_iter([
+                                                ("to".to_string(), AttrValue::String("s.whatsapp.net".to_string())),
+                                                ("type".to_string(), AttrValue::String("result".to_string())),
+                                                ("id".to_string(), AttrValue::String(iq_id.clone())),
+                                            ]).collect(),
+                                            Content::None,
+                                        );
+                                        
+                                        // Send ack directly using self!
+                                        if let Err(e) = self.send_node(&ack_node).await {
+                                            tracing::error!("Failed to send pair-device ack: {}", e);
+                                        } else {
+                                            tracing::info!("Sent ACK for pair-device IQ {}", iq_id);
+                                        }
+
+                                        if let Content::Nodes(children) = &node.content {
+                                            if let Some(pair_device_node) = children.iter().find(|c| c.tag == "pair-device") {
+                                                let s = store.lock().await;
+                                                for ref_child in pair_device_node.get_children_by_tag("ref") {
+                                                    if let Content::Bytes(ref_bytes) = &ref_child.content {
+                                                        let ref_str = String::from_utf8_lossy(ref_bytes).to_string();
+                                                        let engine = base64::engine::general_purpose::STANDARD;
+                                                        use base64::Engine;
+                                                        let qr_data = format!(
+                                                            "{},{},{},{}",
+                                                            ref_str,
+                                                            engine.encode(&s.noise_key.pub_key),
+                                                            engine.encode(&s.identity_key_pub),
+                                                            engine.encode(&s.adv_secret.0),
+                                                        );
+                                                        tracing::info!("QR ref received from server: {}", ref_str);
+                                                        let _ = event_tx.send(WhatsAppEvent::QrCode(qr_data));
+                                                        break; // Display only first QR
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("Failed to decrypt message {}: {}", id, e);
-                                                    None
                                                 }
                                             }
                                         }
-                                        _ => None,
-                                    }
-                                } else {
-                                    // Fallback: try <body> text content
-                                    if let Content::Nodes(children) = &node.content {
-                                        children.iter().find(|c| c.tag == "body")
-                                            .and_then(|c| if let Content::Bytes(b) = &c.content {
-                                                String::from_utf8(b.clone()).ok()
-                                            } else {
-                                                None
-                                            })
-                                    } else {
-                                        None
-                                    }
-                                };
+                                    } else if from == "s.whatsapp.net" && first_child_tag == "pair-success" {
+                                        tracing::info!("Received pair-success IQ, processing...");
+                                        let iq_id = node.get_attr("id").unwrap_or("").to_string();
 
-                                let msg = Message {
-                                    id: MessageId(id),
-                                    chat_id: ChatId(from.clone()),
-                                    sender_id: sender_jid.to_string(),
-                                    text,
-                                    media: None,
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                    is_from_me: false,
-                                    is_forwarded: false,
-                                    reply_to_id: None,
-                                };
-                                let _ = event_tx.send(WhatsAppEvent::MessageReceived(msg));
-                            }
-                            "receipt" => {
-                                let id = node.get_attr("id").unwrap_or("").to_string();
-                                let from = node.get_attr("from").unwrap_or("").to_string();
-                                let _ = event_tx.send(WhatsAppEvent::ReceiptReceived {
-                                    id,
-                                    from,
-                                    timestamp: chrono::Utc::now().timestamp(),
-                                });
-                            }
-                            "success" => {
-                                tracing::info!("Login successful");
-                                if let Some(jid_str) = node.get_attr("lid").or_else(|| node.get_attr("jid")) {
-                                    let jid = jid_str.to_string();
+                                        // Extract pair-success child nodes
+                                        if let Content::Nodes(children) = &node.content {
+                                            if let Some(pair_success_node) = children.iter().find(|c| c.tag == "pair-success") {
+                                                let device_identity_bytes = pair_success_node.get_child_by_tag("device-identity")
+                                                    .and_then(|n| match &n.content { Content::Bytes(b) => Some(b.clone()), _ => None });
+                                                // Device JID can be AttrValue::Jid or AttrValue::String
+                                                let jid_str = pair_success_node.get_child_by_tag("device")
+                                                    .and_then(|n| {
+                                                        n.attrs.get("jid").map(|val| match val {
+                                                            AttrValue::String(s) => s.clone(),
+                                                            AttrValue::Jid(j) => j.to_string(),
+                                                            _ => String::new(),
+                                                        })
+                                                    })
+                                                    .filter(|s| !s.is_empty());
+
+                                                if let (Some(di_bytes), Some(jid)) = (device_identity_bytes, jid_str) {
+                                                    match Self::handle_pair_success(
+                                                        &di_bytes, &iq_id, &jid, &store, &event_tx, &self
+                                                    ).await {
+                                                        Ok(()) => {
+                                                            tracing::info!("✅ Pairing completed successfully as {}", jid);
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("Failed to handle pair-success: {}", e);
+                                                            // Send error IQ
+                                                            let err_node = Node::new(
+                                                                "iq",
+                                                                IntoIterator::into_iter([
+                                                                    ("to".to_string(), AttrValue::String("s.whatsapp.net".to_string())),
+                                                                    ("type".to_string(), AttrValue::String("error".to_string())),
+                                                                    ("id".to_string(), AttrValue::String(iq_id.clone())),
+                                                                ]).collect(),
+                                                                Content::Nodes(vec![
+                                                                    Node::new("error", IntoIterator::into_iter([
+                                                                        ("code".to_string(), AttrValue::String("500".to_string())),
+                                                                        ("text".to_string(), AttrValue::String("internal-error".to_string())),
+                                                                    ]).collect(), Content::None),
+                                                                ]),
+                                                            );
+                                                            let _ = self.send_node(&err_node).await;
+                                                        }
+                                                    }
+                                                } else {
+                                                    // Detailed logging for debugging
+                                                    let has_di = pair_success_node.get_child_by_tag("device-identity").is_some();
+                                                    let has_dev = pair_success_node.get_child_by_tag("device").is_some();
+                                                    let di_content = pair_success_node.get_child_by_tag("device-identity")
+                                                        .map(|n| format!("{:?}", std::mem::discriminant(&n.content)));
+                                                    let dev_attrs = pair_success_node.get_child_by_tag("device")
+                                                        .map(|n| format!("{:?}", n.attrs.keys().collect::<Vec<_>>()));
+                                                    tracing::error!(
+                                                        "pair-success missing data: di_node={}, di_content={:?}, dev_node={}, dev_attrs={:?}",
+                                                        has_di, di_content, has_dev, dev_attrs
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Respond to unhandled server IQs (type=get/set) to prevent timeouts
+                                    if (iq_type == "get" || iq_type == "set") 
+                                        && first_child_tag != "pair-device" 
+                                        && first_child_tag != "pair-success" 
                                     {
-                                        let mut s = store.lock().await;
-                                        s.our_jid = Some(jid.clone());
+                                        let iq_id_resp = node.get_attr("id").unwrap_or("").to_string();
+                                        if !iq_id_resp.is_empty() {
+                                            let ack = Node::new(
+                                                "iq",
+                                                IntoIterator::into_iter([
+                                                    ("to".to_string(), AttrValue::String("s.whatsapp.net".to_string())),
+                                                    ("type".to_string(), AttrValue::String("result".to_string())),
+                                                    ("id".to_string(), AttrValue::String(iq_id_resp.clone())),
+                                                ]).collect(),
+                                                Content::None,
+                                            );
+                                            if let Err(e) = self.send_node(&ack).await {
+                                                tracing::warn!("Failed to ACK IQ {}: {}", iq_id_resp, e);
+                                            } else {
+                                                tracing::debug!("Auto-ACKed IQ {} (type={})", iq_id_resp, iq_type);
+                                            }
+                                        }
                                     }
-                                    // Persist store after login
-                                    Self::persist_store_static(&store, &db_path).await;
-                                    let _ = event_tx.send(WhatsAppEvent::Connected { jid });
-                                }
-                            }
-                            "failure" => {
-                                let reason = node.get_attr("reason").unwrap_or("unknown");
-                                tracing::error!("Login failed: {}", reason);
-                            }
-                            "stream:error" => {
-                                tracing::error!("Stream error received");
-                                *state.lock().await = ConnectionState::Disconnected;
-                                let _ = event_tx.send(WhatsAppEvent::Disconnected);
-                                break;
-                            }
-                            "notification" => {
-                                let notif_type = node.get_attr("type").unwrap_or("");
-                                tracing::debug!("Notification: type={}", notif_type);
 
-                                // Process history sync notifications
-                                if notif_type == "encrypt" || notif_type == "w:gp2" || notif_type == "server_sync" {
-                                    Self::process_notification(&node, &store, &event_tx).await;
+                                    if let Some(id) = node.get_attr("id") {
+                                        let mut tracker = iq_tracker.lock().await;
+                                        if let Some(tx) = tracker.remove(id) {
+                                            let _ = tx.send(node);
+                                        }
+                                    }
+                                }
+                                "message" => {
+                                    let id = node.get_attr("id").unwrap_or("unknown").to_string();
+                                    let from = node.get_attr("from").unwrap_or("unknown").to_string();
+                                    let participant = node.get_attr("participant").map(|s| s.to_string());
+                                    let sender_jid = participant.as_deref().unwrap_or(&from);
+
+                                    let text = if let Some(enc_node) = node.get_child_by_tag("enc") {
+                                        let enc_type = enc_node.get_attr("type").unwrap_or("");
+                                        match &enc_node.content {
+                                            Content::Bytes(cipher_bytes) => {
+                                                match Self::decrypt_message(cipher_bytes, enc_type, sender_jid, &from, &store).await {
+                                                    Ok(plaintext) => {
+                                                        use crate::proto::wa_web_protobufs_e2e as e2e;
+                                                        if let Ok(e2e_msg) = prost::Message::decode(&plaintext[..]) {
+                                                            let e2e_msg: e2e::Message = e2e_msg;
+                                                            e2e_msg.conversation.or_else(|| {
+                                                                e2e_msg.extended_text_message.and_then(|m| m.text)
+                                                            })
+                                                        } else {
+                                                            String::from_utf8(plaintext).ok()
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!("Failed to decrypt message {}: {}", id, e);
+                                                        None
+                                                    }
+                                                }
+                                            }
+                                            _ => None,
+                                        }
+                                    } else {
+                                        if let Content::Nodes(children) = &node.content {
+                                            children.iter().find(|c| c.tag == "body")
+                                                .and_then(|c| if let Content::Bytes(b) = &c.content {
+                                                    String::from_utf8(b.clone()).ok()
+                                                } else {
+                                                    None
+                                                })
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    let msg = Message {
+                                        id: MessageId(id),
+                                        chat_id: ChatId(from.clone()),
+                                        sender_id: sender_jid.to_string(),
+                                        text,
+                                        media: None,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        is_from_me: false,
+                                        is_forwarded: false,
+                                        reply_to_id: None,
+                                    };
+                                    let _ = event_tx.send(WhatsAppEvent::MessageReceived(msg));
+                                }
+                                "receipt" => {
+                                    let id = node.get_attr("id").unwrap_or("").to_string();
+                                    let from = node.get_attr("from").unwrap_or("").to_string();
+                                    let _ = event_tx.send(WhatsAppEvent::ReceiptReceived {
+                                        id,
+                                        from,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                    });
+                                }
+                                "success" => {
+                                    tracing::info!("Login successful");
+                                    // Use JID from success node attrs, or fall back to stored JID
+                                    let jid = node.get_attr("jid")
+                                        .map(|s| s.to_string())
+                                        .or_else(|| {
+                                            // During login reconnect, JID is already in store
+                                            let store_guard = store.try_lock();
+                                            match store_guard {
+                                                Ok(s) => s.our_jid.clone(),
+                                                Err(_) => None,
+                                            }
+                                        });
+                                    if let Some(jid) = jid {
+                                        {
+                                            if let Ok(mut s) = store.try_lock() {
+                                                if s.our_jid.is_none() {
+                                                    s.our_jid = Some(jid.clone());
+                                                }
+                                            }
+                                        }
+                                        Self::persist_store_static(&store, &db_path).await;
+                                        let _ = event_tx.send(WhatsAppEvent::Connected { jid });
+                                    } else {
+                                        tracing::warn!("Login success but no JID available");
+                                        // Still emit Connected with empty JID so the caller unblocks
+                                        let _ = event_tx.send(WhatsAppEvent::Connected { jid: String::new() });
+                                    }
+                                }
+                                "failure" => {
+                                    let reason = node.get_attr("reason").unwrap_or("unknown");
+                                    tracing::error!("Login failed: {}", reason);
+                                }
+                                "stream:error" => {
+                                    // Log all available details from the stream:error node
+                                    let err_attrs: Vec<_> = node.attrs.iter()
+                                        .map(|(k, v)| format!("{}={:?}", k, v))
+                                        .collect();
+                                    let err_children = match &node.content {
+                                        Content::Nodes(children) => children.iter()
+                                            .map(|c| format!("<{} {:?}>", c.tag, c.attrs))
+                                            .collect::<Vec<_>>().join(", "),
+                                        Content::Bytes(b) => format!("bytes[{}]: {:02x?}", b.len(), &b[..std::cmp::min(64, b.len())]),
+                                        Content::None => "(empty)".to_string(),
+                                    };
+                                    tracing::error!("Stream error received: attrs=[{}], content=[{}]",
+                                        err_attrs.join(", "), err_children);
+                                    *state.lock().await = ConnectionState::Disconnected;
+                                    let _ = event_tx.send(WhatsAppEvent::Disconnected);
+                                    break;
+                                }
+                                "notification" => {
+                                    let notif_type = node.get_attr("type").unwrap_or("");
+                                    tracing::debug!("Notification: type={}", notif_type);
+                                    if notif_type == "encrypt" || notif_type == "w:gp2" || notif_type == "server_sync" {
+                                        Self::process_notification(&node, &store, &event_tx).await;
+                                    }
+                                }
+                                _ => {
+                                    tracing::debug!("Received unhandled node: {}", node.tag);
                                 }
                             }
-                            _ => {
-                                tracing::debug!("Received unhandled node: {}", node.tag);
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to read node: {}", e);
                         }
                     }
                 }
@@ -538,7 +1088,7 @@ impl WhatsAppClient {
                 if let SignalEnvelope::SenderKey(sk_msg) = envelope {
                     let mut store_guard = store.lock().await;
                     if let Some(record) = store_guard.get_sender_key_mut(chat_jid, sender_jid) {
-                        record.decrypt(sk_msg.iteration, &sk_msg.ciphertext)
+                        record.decrypt(sk_msg.iteration.unwrap_or(0), sk_msg.ciphertext.as_deref().unwrap_or_default())
                     } else {
                         Err(anyhow!("No SenderKey for {} in group {}", sender_jid, chat_jid))
                     }
@@ -551,18 +1101,21 @@ impl WhatsAppClient {
                 let envelope = SignalEnvelope::deserialize(cipher_bytes)?;
                 if let SignalEnvelope::PreKey(prekey_msg) = envelope {
                     let inner_signal = crate::proto::signal::SignalMessage::decode(
-                        &prekey_msg.message[..]
+                        prekey_msg.message.as_deref().unwrap_or_default()
                     )?;
 
                     let mut ratchet_pub = [0u8; 32];
-                    if inner_signal.ratcheting_key.len() == 32 {
-                        ratchet_pub.copy_from_slice(&inner_signal.ratcheting_key);
+                    let rk = inner_signal.ratcheting_key.as_deref().unwrap_or_default();
+                    if rk.len() == 32 {
+                        ratchet_pub.copy_from_slice(rk);
+                    } else if rk.len() == 33 && rk[0] == 0x05 {
+                        ratchet_pub.copy_from_slice(&rk[1..]);
                     }
 
                     let mut store_guard = store.lock().await;
                     if let Some(session_bytes) = store_guard.get_session(sender_jid) {
                         let mut session: Session = serde_json::from_slice(session_bytes)?;
-                        let plaintext = session.decrypt(&ratchet_pub, inner_signal.counter, &inner_signal.ciphertext)?;
+                        let plaintext = session.decrypt(&ratchet_pub, inner_signal.counter.unwrap_or(0), inner_signal.ciphertext.as_deref().unwrap_or_default())?;
                         // Persist updated session
                         let updated = serde_json::to_vec(&session)?;
                         store_guard.save_session(sender_jid.to_string(), updated);
@@ -579,14 +1132,17 @@ impl WhatsAppClient {
                 let envelope = SignalEnvelope::deserialize(cipher_bytes)?;
                 if let SignalEnvelope::Signal(signal_msg) = envelope {
                     let mut ratchet_pub = [0u8; 32];
-                    if signal_msg.ratcheting_key.len() == 32 {
-                        ratchet_pub.copy_from_slice(&signal_msg.ratcheting_key);
+                    let rk = signal_msg.ratcheting_key.as_deref().unwrap_or_default();
+                    if rk.len() == 32 {
+                        ratchet_pub.copy_from_slice(rk);
+                    } else if rk.len() == 33 && rk[0] == 0x05 {
+                        ratchet_pub.copy_from_slice(&rk[1..]);
                     }
 
                     let mut store_guard = store.lock().await;
                     if let Some(session_bytes) = store_guard.get_session(sender_jid) {
                         let mut session: Session = serde_json::from_slice(session_bytes)?;
-                        let plaintext = session.decrypt(&ratchet_pub, signal_msg.counter, &signal_msg.ciphertext)?;
+                        let plaintext = session.decrypt(&ratchet_pub, signal_msg.counter.unwrap_or(0), signal_msg.ciphertext.as_deref().unwrap_or_default())?;
                         let updated = serde_json::to_vec(&session)?;
                         store_guard.save_session(sender_jid.to_string(), updated);
                         Ok(plaintext)
@@ -744,15 +1300,16 @@ impl WhatsAppClient {
         user_attrs.insert("jid".to_string(), AttrValue::String(jid.to_string()));
 
         let user_node = Node::new("user", user_attrs, Content::None);
-        let query_node = Node::new("query", [("xmlns".to_string(), AttrValue::String("encrypt".to_string()))].into(), Content::Nodes(vec![user_node]));
+        // whatsmeow uses <key> wrapper (not <query>); IQ goes to server, not user
+        let key_node = Node::new("key", HashMap::new(), Content::Nodes(vec![user_node]));
 
         let mut iq_attrs = HashMap::new();
         iq_attrs.insert("id".to_string(), AttrValue::String(id));
         iq_attrs.insert("xmlns".to_string(), AttrValue::String("encrypt".to_string()));
         iq_attrs.insert("type".to_string(), AttrValue::String("get".to_string()));
-        iq_attrs.insert("to".to_string(), AttrValue::String(jid.to_string()));
+        iq_attrs.insert("to".to_string(), AttrValue::String("s.whatsapp.net".to_string()));
 
-        let iq_node = Node::new("iq", iq_attrs, Content::Nodes(vec![query_node]));
+        let iq_node = Node::new("iq", iq_attrs, Content::Nodes(vec![key_node]));
         self.send_iq(iq_node).await
     }
 
@@ -762,19 +1319,29 @@ impl WhatsAppClient {
             let store = self.store.lock().await;
             if let Some(session_bytes) = store.get_session(jid) {
                 let session: Session = serde_json::from_slice(session_bytes)?;
+                tracing::info!("Reusing existing session for {}", jid);
                 return Ok(session);
             }
         }
 
-        // 2. Fetch PreKeys from server
-        let prekey_node = self.fetch_prekeys(jid).await?;
+        // 2. Fetch PreKeys from server (use bare JID for prekey fetch)
+        let bare_jid = if jid.contains(':') {
+            // Device JID like "user:0@s.whatsapp.net" → fetch prekeys for bare "user@s.whatsapp.net"
+            let parts: Vec<&str> = jid.splitn(2, ':').collect();
+            let domain_part = parts[1].split('@').nth(1).unwrap_or("s.whatsapp.net");
+            format!("{}@{}", parts[0], domain_part)
+        } else {
+            jid.to_string()
+        };
+        tracing::info!("Fetching prekeys for {} (bare: {})", jid, bare_jid);
+        let prekey_node = self.fetch_prekeys(&bare_jid).await?;
 
         // 3. Parse PreKeys from the response node
-        let (remote_identity, remote_signed_prekey, remote_prekey_id, remote_skey_id) =
+        let (remote_identity, remote_signed_prekey, remote_prekey_id, remote_skey_id, remote_otpk) =
             Self::parse_prekey_response(&prekey_node)?;
 
         // 4. X3DH key agreement using our identity key
-        let (my_identity_priv, my_identity_pub) = {
+        let (my_identity_priv, _my_identity_pub) = {
             let store = self.store.lock().await;
             (store.identity_key_priv, store.identity_key_pub)
         };
@@ -782,13 +1349,17 @@ impl WhatsAppClient {
         let my_ephemeral = StaticSecret::random_from_rng(rand::thread_rng());
         let ephemeral_pub = PublicKey::from(&my_ephemeral);
 
+        // Include one-time prekey in X3DH if the server provided one
+        let otpk_pubkey = remote_otpk.map(PublicKey::from);
         let root_key_bytes = crate::crypto::derive_root_key(
             &my_identity,
             &my_ephemeral,
             &PublicKey::from(remote_identity),
             &PublicKey::from(remote_signed_prekey),
-            None,
+            otpk_pubkey.as_ref(),
         );
+
+        tracing::info!("X3DH complete: root_key[0..4]={:02x?}, used_otpk={}", &root_key_bytes[..4], remote_otpk.is_some());
 
         let root_key = crate::crypto::ratchet::RootKey::new(root_key_bytes);
         let mut session = Session::new_as_sender(remote_identity, root_key, remote_signed_prekey);
@@ -811,54 +1382,82 @@ impl WhatsAppClient {
     }
 
     /// Parse a prekey response IQ node to extract the remote's identity key,
-    /// signed prekey, and related IDs.
-    fn parse_prekey_response(node: &Node) -> Result<([u8; 32], [u8; 32], u32, u32)> {
+    /// signed prekey, one-time prekey, and related IDs.
+    /// Returns: (identity, signed_prekey, prekey_id, skey_id, one_time_prekey_value)
+    fn parse_prekey_response(node: &Node) -> Result<([u8; 32], [u8; 32], u32, u32, Option<[u8; 32]>)> {
         let list_node = node.get_child_by_tag("list")
             .ok_or_else(|| anyhow!("Missing <list> in prekey response"))?;
         let user_node = list_node.get_child_by_tag("user")
             .ok_or_else(|| anyhow!("Missing <user> in prekey response"))?;
 
-        // Parse identity key
+        // Log the device JID from the response
+        if let Some(jid_attr) = user_node.get_attr("jid") {
+            tracing::info!("Prekey response device JID: {}", jid_attr);
+        }
+
+        // Parse identity key (accept 32 or 33 bytes, strip 0x05 prefix if present)
         let identity_node = user_node.get_child_by_tag("identity")
             .ok_or_else(|| anyhow!("Missing <identity> in prekey response"))?;
-        let identity_bytes = match &identity_node.content {
-            Content::Bytes(b) if b.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(b);
-                arr
-            }
-            _ => return Err(anyhow!("Invalid identity key format")),
-        };
+        let identity_bytes = Self::extract_key_32(&identity_node.content, "identity")?;
 
         // Parse signed prekey
         let skey_node = user_node.get_child_by_tag("skey")
             .ok_or_else(|| anyhow!("Missing <skey> in prekey response"))?;
         let skey_value_node = skey_node.get_child_by_tag("value")
             .ok_or_else(|| anyhow!("Missing <value> in <skey>"))?;
-        let skey_bytes = match &skey_value_node.content {
+        let skey_bytes = Self::extract_key_32(&skey_value_node.content, "signed prekey")?;
+
+        let skey_id = Self::parse_key_id(skey_node.get_child_by_tag("id"));
+
+        // Parse one-time prekey (both ID and VALUE)
+        let (prekey_id, prekey_value) = if let Some(key_node) = user_node.get_child_by_tag("key") {
+            let id = Self::parse_key_id(key_node.get_child_by_tag("id"));
+            let value = key_node.get_child_by_tag("value")
+                .and_then(|v| Self::extract_key_32(&v.content, "one-time prekey").ok());
+            tracing::info!("One-time prekey: id={}, has_value={}", id, value.is_some());
+            (id, value)
+        } else {
+            tracing::info!("No one-time prekey in response");
+            (0, None)
+        };
+
+        tracing::info!("Parsed prekeys: identity={}B, skey={}B (id={}), prekey_id={}, has_otpk={}",
+            identity_bytes.len(), skey_bytes.len(), skey_id, prekey_id, prekey_value.is_some());
+
+        Ok((identity_bytes, skey_bytes, prekey_id, skey_id, prekey_value))
+    }
+
+    /// Extract a 32-byte key from Content::Bytes, handling both 32-byte (raw) and 33-byte (0x05 prefix) formats.
+    fn extract_key_32(content: &Content, name: &str) -> Result<[u8; 32]> {
+        match content {
             Content::Bytes(b) if b.len() == 32 => {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(b);
-                arr
+                Ok(arr)
             }
-            _ => return Err(anyhow!("Invalid signed prekey format")),
-        };
-
-        let skey_id = Self::parse_node_u32(skey_node.get_child_by_tag("id"));
-
-        // Parse one-time prekey id
-        let prekey_id = user_node.get_child_by_tag("key")
-            .and_then(|k| Self::parse_node_u32(k.get_child_by_tag("id")).into())
-            .unwrap_or(0);
-
-        Ok((identity_bytes, skey_bytes, prekey_id, skey_id))
+            Content::Bytes(b) if b.len() == 33 && b[0] == 0x05 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b[1..]);
+                Ok(arr)
+            }
+            Content::Bytes(b) => Err(anyhow!("Invalid {} key length: {} bytes", name, b.len())),
+            _ => Err(anyhow!("Invalid {} key format: expected bytes", name)),
+        }
     }
 
-    fn parse_node_u32(node: Option<&Node>) -> u32 {
+    /// Parse a key ID from a node's binary content.
+    /// WhatsApp encodes key IDs as 3-byte big-endian (matching whatsmeow's serializedKeyID).
+    fn parse_key_id(node: Option<&Node>) -> u32 {
         match node {
             Some(n) => {
                 if let Content::Bytes(b) = &n.content {
-                    String::from_utf8_lossy(b).parse::<u32>().unwrap_or(0)
+                    match b.len() {
+                        3 => (b[0] as u32) << 16 | (b[1] as u32) << 8 | (b[2] as u32),
+                        4 => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+                        2 => (b[0] as u32) << 8 | (b[1] as u32),
+                        1 => b[0] as u32,
+                        _ => String::from_utf8_lossy(b).parse::<u32>().unwrap_or(0),
+                    }
                 } else {
                     0
                 }

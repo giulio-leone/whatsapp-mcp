@@ -178,8 +178,8 @@ impl DoubleRatchet {
         }
     }
 
-    /// Encrypt a plaintext message. Returns (ciphertext, our_ratchet_pub, counter, previous_counter).
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 32], u32, u32)> {
+    /// Encrypt a plaintext message. Returns (ciphertext, our_ratchet_pub, counter, previous_counter, msg_keys).
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 32], u32, u32, MessageKeys)> {
         let chain = self.sending_chain.as_mut()
             .ok_or_else(|| anyhow::anyhow!("No sending chain — ratchet not initialized"))?;
 
@@ -193,7 +193,7 @@ impl DoubleRatchet {
             plaintext,
         )?;
 
-        Ok((ciphertext, self.our_ratchet_pub, counter, self.previous_counter))
+        Ok((ciphertext, self.our_ratchet_pub, counter, self.previous_counter, msg_keys))
     }
 
     /// Decrypt a message given the sender's ratchet public key, counter, and ciphertext.

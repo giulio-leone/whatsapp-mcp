@@ -135,7 +135,8 @@ impl<'a> Decoder<'a> {
         let content = match content_val {
             None => Content::None,
             Some(AttrValue::Nodes(nodes)) => Content::Nodes(nodes),
-            Some(AttrValue::String(s)) => Content::Bytes(s.into_bytes()), // Fallback for binary blobs
+            Some(AttrValue::Bytes(bytes)) => Content::Bytes(bytes),
+            Some(AttrValue::String(s)) => Content::Bytes(s.into_bytes()),
             _ => Content::None,
         };
 
@@ -160,18 +161,26 @@ impl<'a> Decoder<'a> {
                 if as_string {
                     Ok(Some(AttrValue::String(String::from_utf8_lossy(bytes).into_owned())))
                 } else {
-                    Ok(Some(AttrValue::String(hex::encode(bytes))))
+                    Ok(Some(AttrValue::Bytes(bytes.to_vec())))
                 }
             }
             BINARY_20 => {
                 let size = self.read_int20()? as usize;
                 let bytes = self.read_raw(size)?;
-                Ok(Some(AttrValue::String(String::from_utf8_lossy(bytes).to_string())))
+                if as_string {
+                    Ok(Some(AttrValue::String(String::from_utf8_lossy(bytes).to_string())))
+                } else {
+                    Ok(Some(AttrValue::Bytes(bytes.to_vec())))
+                }
             }
             BINARY_32 => {
                 let size = self.read_int_n(4)? as usize;
                 let bytes = self.read_raw(size)?;
-                Ok(Some(AttrValue::String(String::from_utf8_lossy(bytes).to_string())))
+                if as_string {
+                    Ok(Some(AttrValue::String(String::from_utf8_lossy(bytes).to_string())))
+                } else {
+                    Ok(Some(AttrValue::Bytes(bytes.to_vec())))
+                }
             }
             DICTIONARY_0..=DICTIONARY_3 => {
                 let index = self.read_byte()? as usize;

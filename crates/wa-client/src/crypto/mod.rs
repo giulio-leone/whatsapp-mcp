@@ -4,6 +4,7 @@ pub mod cbc;
 pub mod envelope;
 pub mod x3dh;
 pub mod sender_key;
+pub mod xeddsa;
 
 pub use session::Session;
 pub use envelope::SignalEnvelope;

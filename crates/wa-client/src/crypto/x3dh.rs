@@ -14,8 +14,9 @@ pub fn derive_root_key(
     let dh2 = my_ephemeral.diffie_hellman(remote_identity);
     let dh3 = my_ephemeral.diffie_hellman(remote_signed_prekey);
     
-    let mut ikm = Vec::with_capacity(32 * 4);
-    // WhatsApp/Signal X3DH order: DH1 = DH(IK_A, SPK_B), DH2 = DH(EK_A, IK_B), DH3 = DH(EK_A, SPK_B)
+    // Signal X3DH: prepend 32 bytes of 0xFF (discontinuity bytes) per spec
+    let mut ikm = Vec::with_capacity(32 + 32 * 4);
+    ikm.extend_from_slice(&[0xFF; 32]);
     ikm.extend_from_slice(dh1.as_bytes());
     ikm.extend_from_slice(dh2.as_bytes());
     ikm.extend_from_slice(dh3.as_bytes());
@@ -25,10 +26,10 @@ pub fn derive_root_key(
         ikm.extend_from_slice(dh4.as_bytes());
     }
 
-    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    // Signal X3DH spec: salt = 32 zero bytes, info = "WhisperText"
+    let salt = [0u8; 32];
+    let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
     let mut okm = [0u8; 32];
-    // Note: Signal uses some padding/prefix in HKDF? 
-    // Usually it's just an empty salt and empty info or a specific string.
-    hk.expand(b"WhatsApp X3DH", &mut okm).expect("HKDF expand failed");
+    hk.expand(b"WhisperText", &mut okm).expect("HKDF expand failed");
     okm
 }

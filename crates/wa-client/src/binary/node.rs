@@ -7,6 +7,7 @@ pub enum AttrValue {
     Jid(Jid),
     Int(i64),
     Nodes(Vec<Node>),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -22,6 +22,59 @@ impl NoiseKey {
     }
 }
 
+/// Signal signed pre-key for device pairing registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedPreKey {
+    pub key_id: u32,
+    pub priv_key: [u8; 32],
+    pub pub_key: [u8; 32],
+    pub signature: Vec<u8>,
+}
+
+impl SignedPreKey {
+    /// Generate a new signed pre-key, signed by the identity key using XEdDSA.
+    ///
+    /// This matches whatsmeow's `KeyPair.Sign()` which uses
+    /// `ecc.CalculateSignature(ecc.NewDjbECPrivateKey(*kp.Priv), pubKeyForSignature)`
+    /// — an XEdDSA signature (Curve25519 → Ed25519 conversion + sign).
+    pub fn new(identity_priv_bytes: &[u8; 32]) -> Self {
+        let priv_key = StaticSecret::random_from_rng(rand::thread_rng());
+        let pub_key = PublicKey::from(&priv_key);
+        let key_id = rand::random::<u16>() as u32 | 1;
+
+        // Prepend 0x05 (ecc.DjbType) to the public key before signing,
+        // exactly as whatsmeow does in keypair.go:49-51
+        let mut pub_key_for_signature = Vec::with_capacity(33);
+        pub_key_for_signature.push(5); // ecc.DjbType = 5
+        pub_key_for_signature.extend_from_slice(pub_key.as_bytes());
+
+        // Sign using XEdDSA (NOT plain ed25519)
+        let signature = crate::crypto::xeddsa::xeddsa_sign(
+            identity_priv_bytes,
+            &pub_key_for_signature,
+        );
+
+        Self {
+            key_id,
+            priv_key: priv_key.to_bytes(),
+            pub_key: *pub_key.as_bytes(),
+            signature: signature.to_vec(),
+        }
+    }
+}
+
+/// ADV (Account Device Verification) secret key for QR code generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvSecretKey(pub [u8; 32]);
+
+impl AdvSecretKey {
+    pub fn new() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        Self(bytes)
+    }
+}
+
 /// Persistent key/session store for the WhatsApp client.
 ///
 /// Serialized to/from JSON and persisted to SQLite via the `device_store`
@@ -32,6 +85,8 @@ pub struct DeviceStore {
     pub identity_key_priv: [u8; 32],
     pub identity_key_pub: [u8; 32],
     pub registration_id: u32,
+    pub signed_prekey: SignedPreKey,
+    pub adv_secret: AdvSecretKey,
     /// Maps JID → serialized Signal session JSON
     pub sessions: HashMap<String, Vec<u8>>,
     /// Maps LID → JID
@@ -43,23 +98,29 @@ pub struct DeviceStore {
     pub chats: HashMap<String, Chat>,
     /// Our JID after successful login
     pub our_jid: Option<String>,
+    /// Serialized ADVSignedDeviceIdentity (used for device-identity node in pkmsg sends)
+    pub account_identity: Option<Vec<u8>>,
 }
 
 impl DeviceStore {
     pub fn new() -> Self {
         let identity_priv = StaticSecret::random_from_rng(rand::thread_rng());
         let identity_pub = PublicKey::from(&identity_priv);
+        let identity_priv_bytes = identity_priv.to_bytes();
 
         Self {
             noise_key: NoiseKey::new(),
-            identity_key_priv: identity_priv.to_bytes(),
+            identity_key_priv: identity_priv_bytes,
             identity_key_pub: *identity_pub.as_bytes(),
             registration_id: (rand::random::<u16>() as u32) | 1, // Must be non-zero
+            signed_prekey: SignedPreKey::new(&identity_priv_bytes),
+            adv_secret: AdvSecretKey::new(),
             sessions: HashMap::new(),
             lid_to_jid: HashMap::new(),
             sender_keys: HashMap::new(),
             chats: HashMap::new(),
             our_jid: None,
+            account_identity: None,
         }
     }
 

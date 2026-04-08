@@ -4,6 +4,22 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "wa-mcp-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "wa-pair"
+path = "src/bin/wa_pair.rs"
+
+[[bin]]
+name = "wa-send"
+path = "src/bin/wa_send.rs"
+
+[[bin]]
+name = "wa-mcp-bridge"
+path = "src/bin/wa_mcp_bridge.rs"
+
 [dependencies]
 wa-domain = { path = "../domain" }
 wa-client = { path = "../wa-client" }
@@ -13,5 +29,10 @@ serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"

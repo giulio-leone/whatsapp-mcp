@@ -50,8 +50,8 @@ impl Session {
         }
     }
 
-    /// Encrypt plaintext. Returns (ciphertext, ratchet_pub, counter, prev_counter).
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 32], u32, u32)> {
+    /// Encrypt plaintext. Returns (ciphertext, ratchet_pub, counter, prev_counter, msg_keys).
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 32], u32, u32, crate::crypto::ratchet::MessageKeys)> {
         self.ratchet.encrypt(plaintext)
     }
 

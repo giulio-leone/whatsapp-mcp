@@ -13,7 +13,7 @@ pub const DOUBLE_BYTE_TOKENS: &[&[&str]] = &[
 ];
 
 pub const WAMAGIC_VALUE: u8 = 6;
-pub const DICT_VERSION: u8 = 2;
+pub const DICT_VERSION: u8 = 3;
 pub const WA_CONN_HEADER: &[u8] = &[b'W', b'A', WAMAGIC_VALUE, DICT_VERSION];
 
 pub const LIST_EMPTY: u8 = 0;

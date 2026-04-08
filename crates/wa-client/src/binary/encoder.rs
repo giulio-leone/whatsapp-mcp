@@ -12,7 +12,8 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        // Flag byte 0x00 = no compression (matches whatsmeow: binaryEncoder{[]byte{0}})
+        Self { data: vec![0x00] }
     }
 
     pub fn encode(&mut self, node: &Node) -> Result<Vec<u8>> {
@@ -95,6 +96,7 @@ impl Encoder {
             AttrValue::String(s) => self.write_string(s),
             AttrValue::Jid(jid) => self.write_jid(jid),
             AttrValue::Int(i) => self.write_string(&i.to_string()),
+            AttrValue::Bytes(b) => { self.write_binary(b); Ok(()) },
             AttrValue::Nodes(nodes) => {
                 self.write_list_start(nodes.len());
                 for n in nodes {
