@@ -152,6 +152,15 @@ impl WhatsAppClientPort for BridgeClient {
         })
     }
 
+    async fn send_reaction(&self, chat_id: &ChatId, message_id: &str, emoji: &str) -> Result<()> {
+        self.rpc("send_reaction", json!({
+            "chat_id": chat_id.0,
+            "message_id": message_id,
+            "emoji": emoji
+        })).await?;
+        Ok(())
+    }
+
     async fn list_chats(&self) -> Result<Vec<Chat>> {
         let result = self.rpc("list_chats", json!({})).await?;
         let chats = result["chats"]

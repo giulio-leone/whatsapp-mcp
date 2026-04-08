@@ -28,6 +28,14 @@ path = "src/bin/wa_broadcast.rs"
 name = "wa-track"
 path = "src/bin/wa_track.rs"
 
+[[bin]]
+name = "wa-poll"
+path = "src/bin/wa_poll.rs"
+
+[[bin]]
+name = "wa-status"
+path = "src/bin/wa_status.rs"
+
 [dependencies]
 wa-domain = { path = "../domain" }
 wa-client = { path = "../wa-client" }
@@ -44,3 +52,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
+serde_yaml = "0.9"
+regex = "1"

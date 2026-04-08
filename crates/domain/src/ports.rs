@@ -11,6 +11,8 @@ pub trait WhatsAppClientPort: Send + Sync {
     async fn disconnect(&self) -> Result<()>;
     /// Sends a text message to a specific chat (Contact or Group)
     async fn send_message(&self, chat_id: &ChatId, text: &str) -> Result<Message>;
+    /// Sends an emoji reaction to a message
+    async fn send_reaction(&self, chat_id: &ChatId, message_id: &str, emoji: &str) -> Result<()>;
     /// Retrieves full list of chats available in the current WA multi-device state
     async fn list_chats(&self) -> Result<Vec<Chat>>;
 }

@@ -32,6 +32,7 @@ pub enum WhatsAppEvent {
     MessageReceived(Message),
     ReceiptReceived { id: String, from: String, timestamp: i64 },
     PresenceUpdate { jid: String, available: bool, last_seen: Option<i64> },
+    StatusReceived { from: String, text: Option<String>, media_type: Option<String>, timestamp: i64 },
     HistorySynced { chat_count: usize },
     Disconnected,
 }
@@ -336,6 +337,100 @@ impl WhatsAppClientPort for WhatsAppClient {
             is_forwarded: false,
             reply_to_id: None,
         })
+    }
+
+    async fn send_reaction(&self, chat_id: &ChatId, message_id: &str, emoji: &str) -> Result<()> {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use crate::proto::wa_common;
+        use prost::Message as ProstMessage;
+
+        let jid = chat_id.0.clone();
+        let full_jid = if jid.contains('@') { jid.clone() } else { format!("{}@s.whatsapp.net", jid) };
+        let user_part = full_jid.split('@').next().unwrap_or(&full_jid);
+        tracing::info!("Sending reaction {} to message {} in {}", emoji, message_id, full_jid);
+
+        // Build reaction message proto
+        let reaction_msg = e2e::Message {
+            reaction_message: Some(e2e::ReactionMessage {
+                key: Some(wa_common::MessageKey {
+                    remote_jid: Some(full_jid.clone()),
+                    from_me: Some(false),
+                    id: Some(message_id.to_string()),
+                    participant: None,
+                }),
+                text: Some(emoji.to_string()),
+                sender_timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
+                grouping_key: None,
+            }),
+            ..Default::default()
+        };
+
+        let mut e2e_bytes = Vec::new();
+        reaction_msg.encode(&mut e2e_bytes)?;
+        let padded = Self::pad_message(&e2e_bytes);
+
+        // Discover devices and encrypt
+        let recipient_devices = self.discover_devices(user_part).await;
+        let mut to_nodes = Vec::new();
+        let mut sessions_to_persist: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for device_id in &recipient_devices {
+            let device_jid = format!("{}:{}@s.whatsapp.net", user_part, device_id);
+            match self.encrypt_for_device(&device_jid, &padded).await {
+                Ok((enc_type, envelope, session)) => {
+                    let mut enc_attrs = HashMap::new();
+                    enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
+                    enc_attrs.insert("type".to_string(), AttrValue::String(enc_type));
+                    let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
+
+                    let mut to_attrs = HashMap::new();
+                    to_attrs.insert("jid".to_string(), AttrValue::String(device_jid.clone()));
+                    let to_node = Node::new("to", to_attrs, Content::Nodes(vec![enc_node]));
+                    to_nodes.push(to_node);
+
+                    let session_bytes = serde_json::to_vec(&session)?;
+                    sessions_to_persist.push((device_jid, session_bytes));
+                }
+                Err(e) => tracing::warn!("Failed to encrypt reaction for {}: {}", device_jid, e),
+            }
+        }
+
+        if to_nodes.is_empty() {
+            anyhow::bail!("Failed to encrypt reaction for any device");
+        }
+
+        // Generate message ID
+        let msg_id = {
+            let store = self.store.lock().await;
+            let our_jid_full = store.our_jid.clone().unwrap_or_default();
+            let random_bytes: [u8; 4] = rand::random();
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(our_jid_full.as_bytes());
+            hasher.update(&random_bytes);
+            let hash = hasher.finalize();
+            format!("3EB0{}", hex::encode(&hash[..9]).to_uppercase())
+        };
+
+        let participants_node = Node::new("participants", HashMap::new(), Content::Nodes(to_nodes));
+        let mut msg_attrs = HashMap::new();
+        msg_attrs.insert("id".to_string(), AttrValue::String(msg_id.clone()));
+        msg_attrs.insert("to".to_string(), AttrValue::String(full_jid));
+        msg_attrs.insert("type".to_string(), AttrValue::String("text".to_string()));
+        let message_node = Node::new("message", msg_attrs, Content::Nodes(vec![participants_node]));
+
+        self.send_node(&message_node).await?;
+
+        // Persist sessions
+        {
+            let mut store = self.store.lock().await;
+            for (jid, bytes) in sessions_to_persist {
+                store.save_session(jid, bytes);
+            }
+        }
+        let _ = self.persist_store().await;
+        tracing::info!("Reaction {} sent (msg: {})", emoji, msg_id);
+        Ok(())
     }
 
     async fn list_chats(&self) -> Result<Vec<Chat>> {
@@ -1191,17 +1286,28 @@ impl WhatsAppClient {
                                     };
 
                                     let msg = Message {
-                                        id: MessageId(id),
+                                        id: MessageId(id.clone()),
                                         chat_id: ChatId(from.clone()),
                                         sender_id: sender_jid.to_string(),
-                                        text,
+                                        text: text.clone(),
                                         media: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         is_from_me: false,
                                         is_forwarded: false,
                                         reply_to_id: None,
                                     };
-                                    let _ = event_tx.send(WhatsAppEvent::MessageReceived(msg));
+
+                                    // Status messages come from status@broadcast
+                                    if from.contains("status@broadcast") || from == "status@broadcast" {
+                                        let _ = event_tx.send(WhatsAppEvent::StatusReceived {
+                                            from: sender_jid.to_string(),
+                                            text,
+                                            media_type: None,
+                                            timestamp: chrono::Utc::now().timestamp(),
+                                        });
+                                    } else {
+                                        let _ = event_tx.send(WhatsAppEvent::MessageReceived(msg));
+                                    }
                                 }
                                 "receipt" => {
                                     let id = node.get_attr("id").unwrap_or("").to_string();
@@ -1268,6 +1374,23 @@ impl WhatsAppClient {
                                     tracing::debug!("Notification: type={}", notif_type);
                                     if notif_type == "encrypt" || notif_type == "w:gp2" || notif_type == "server_sync" {
                                         Self::process_notification(&node, &store, &event_tx).await;
+                                    } else if notif_type == "status" {
+                                        // Status/story update notification
+                                        let from = node.get_attr("participant")
+                                            .or_else(|| node.get_attr("from"))
+                                            .unwrap_or("").to_string();
+                                        let t = node.get_attr("t")
+                                            .and_then(|v| v.parse::<i64>().ok())
+                                            .unwrap_or(0);
+                                        tracing::info!("Status update from: {} at t={}", from, t);
+                                        let _ = event_tx.send(WhatsAppEvent::StatusReceived {
+                                            from,
+                                            text: None,
+                                            media_type: None,
+                                            timestamp: t,
+                                        });
+                                    } else {
+                                        tracing::debug!("Unhandled notification type: {}", notif_type);
                                     }
                                 }
                                 "presence" => {
