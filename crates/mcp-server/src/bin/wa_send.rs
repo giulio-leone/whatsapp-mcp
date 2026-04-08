@@ -70,8 +70,10 @@ async fn main() -> anyhow::Result<()> {
 
     let client = WhatsAppClient::with_db_path(&db_path);
 
-    // Apply stealth mode if --stealth flag present
-    if args.iter().any(|a| a == "--stealth" || a == "-s") {
+    // Apply stealth mode if --stealth flag or WA_STEALTH=1
+    if args.iter().any(|a| a == "--stealth" || a == "-s")
+        || std::env::var("WA_STEALTH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+    {
         client.set_stealth(true);
         eprintln!("🕵️ Stealth mode ACTIVE");
     }

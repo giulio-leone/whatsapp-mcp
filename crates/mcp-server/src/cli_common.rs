@@ -94,12 +94,17 @@ pub fn read_contacts_file(path: &str) -> anyhow::Result<Vec<String>> {
     Ok(phones)
 }
 
-/// Check if --stealth flag is present in args, and enable stealth mode on the client.
+/// Check if --stealth flag is present in args or WA_STEALTH=1 env var,
+/// and enable stealth mode on the client.
 pub fn apply_stealth_flag(client: &WhatsAppClient) {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--stealth" || a == "-s") {
+    let flag = args.iter().any(|a| a == "--stealth" || a == "-s");
+    let env = std::env::var("WA_STEALTH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+
+    if flag || env {
         client.set_stealth(true);
-        eprintln!("🕵️ Stealth mode ACTIVE — invisible to contacts");
+        let source = if flag && env { "flag + env" } else if flag { "flag" } else { "env WA_STEALTH=1" };
+        eprintln!("🕵️ Stealth mode ACTIVE (via {}) — invisible to contacts", source);
         eprintln!("   • No read receipts (no blue ticks)");
         eprintln!("   • No online presence (appear offline)");
         eprintln!("   • No typing indicators");
