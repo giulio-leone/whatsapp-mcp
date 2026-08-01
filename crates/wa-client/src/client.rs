@@ -9,16 +9,66 @@ use crate::binary::{Encoder, Decoder};
 use x25519_dalek::{StaticSecret, PublicKey};
 use prost::Message as ProstMessage;
 use anyhow::{Result, anyhow, Context};
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::time::Duration;
 use tokio::time::timeout;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 
-use wa_domain::ports::WhatsAppClientPort;
+use wa_domain::ports::{PairingPhase, PairingSnapshot, WhatsAppClientPort};
 use wa_domain::models::chat::{Chat, ChatId};
 use wa_domain::models::message::{Message, MessageId};
 use crate::crypto::session::Session;
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+#[cfg(unix)]
+const LOCK_EX: i32 = 2;
+#[cfg(unix)]
+const LOCK_NB: i32 = 4;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+struct SessionLock {
+    #[allow(dead_code)]
+    file: File,
+}
+
+impl SessionLock {
+    fn acquire(db_path: &str) -> Result<Self> {
+        let lock_path = format!("{db_path}.session.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("Opening WhatsApp session lock at {lock_path}"))?;
+
+        #[cfg(unix)]
+        {
+            let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Err(anyhow!(
+                        "WhatsApp session is already owned by another MCP process"
+                    ));
+                }
+                return Err(anyhow!(
+                    "Could not lock WhatsApp session at {lock_path}: {error}"
+                ));
+            }
+        }
+
+        Ok(Self { file })
+    }
+}
 
 // ─── Events ─────────────────────────────────────────────────────────
 
@@ -44,6 +94,7 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     WaitingForQr,
+    PairingSucceeded,
     Connected,
 }
 
@@ -55,6 +106,10 @@ pub struct WhatsAppClient {
     pub store: Arc<Mutex<DeviceStore>>,
     event_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<WhatsAppEvent>>>,
     state: Arc<Mutex<ConnectionState>>,
+    latest_qr: Arc<Mutex<Option<(String, u64)>>>,
+    lifecycle_lock: Arc<Mutex<()>>,
+    read_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    session_lock: Arc<Mutex<Option<SessionLock>>>,
     db_path: String,
     stealth: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -103,6 +158,10 @@ impl WhatsAppClient {
             store: Arc::new(Mutex::new(store)),
             event_rx: Arc::new(Mutex::new(event_rx)),
             state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
+            latest_qr: Arc::new(Mutex::new(None)),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            read_task: Arc::new(Mutex::new(None)),
+            session_lock: Arc::new(Mutex::new(None)),
             db_path: db_path.to_string(),
             stealth: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -137,36 +196,61 @@ impl WhatsAppClient {
         tracing::debug!("Device store persisted to {}", self.db_path);
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl WhatsAppClientPort for WhatsAppClient {
-    async fn connect(&self) -> Result<()> {
+    async fn stop_read_loop(&self) {
+        let task = self.read_task.lock().await.take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    async fn acquire_session_lock(&self) -> Result<()> {
+        let mut session_lock = self.session_lock.lock().await;
+        if session_lock.is_none() {
+            *session_lock = Some(SessionLock::acquire(&self.db_path)?);
+        }
+        Ok(())
+    }
+
+    async fn release_session_lock(&self) {
+        *self.session_lock.lock().await = None;
+    }
+
+    async fn connect_inner(&self) -> Result<()> {
+        self.acquire_session_lock().await?;
+
         {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             if *state == ConnectionState::Connected {
                 return Ok(());
             }
-            *state = ConnectionState::Connecting;
         }
+
+        // A failed or superseded connection may leave a completed task handle
+        // behind. Awaiting it here makes the next lifecycle owner authoritative.
+        self.stop_read_loop().await;
+        *self.state.lock().await = ConnectionState::Connecting;
 
         let mut inner = self.inner.lock().await;
         match self.connect_internal(&mut inner).await {
             Ok(()) => {
-                *self.state.lock().await = ConnectionState::Connected;
-                // Persist store after successful connection (saves keys)
+                // The Noise handshake is complete, but the WhatsApp session is
+                // not usable until the read loop receives a login success.
                 drop(inner);
                 let _ = self.persist_store().await;
                 Ok(())
             }
             Err(e) => {
                 *self.state.lock().await = ConnectionState::Disconnected;
+                self.release_session_lock().await;
                 Err(e)
             }
         }
     }
 
-    async fn disconnect(&self) -> Result<()> {
+    async fn disconnect_inner(&self) -> Result<()> {
+        self.stop_read_loop().await;
         let mut inner = self.inner.lock().await;
         inner.sender = None;
         *self.state.lock().await = ConnectionState::Disconnected;
@@ -175,6 +259,50 @@ impl WhatsAppClientPort for WhatsAppClient {
         drop(inner);
         let _ = self.persist_store().await;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl WhatsAppClientPort for WhatsAppClient {
+    async fn connect(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.connect_inner().await
+    }
+
+    async fn is_connected(&self) -> Result<bool> {
+        Ok(*self.state.lock().await == ConnectionState::Connected)
+    }
+
+    async fn pairing_snapshot(&self) -> Result<PairingSnapshot> {
+        let state = self.state.lock().await.clone();
+        let account_jid = self.store.lock().await.our_jid.clone();
+        let latest_qr = self.latest_qr.lock().await.clone();
+        let phase = match state {
+            ConnectionState::Connecting => PairingPhase::Preparing,
+            ConnectionState::WaitingForQr => PairingPhase::AwaitingScan,
+            ConnectionState::PairingSucceeded => PairingPhase::Paired,
+            ConnectionState::Connected => PairingPhase::Connected,
+            ConnectionState::Disconnected => PairingPhase::Disconnected,
+        };
+
+        Ok(PairingSnapshot {
+            phase,
+            qr_payload: latest_qr.as_ref().map(|(payload, _)| payload.clone()),
+            qr_created_at_ms: latest_qr.as_ref().map(|(_, created_at)| *created_at),
+            account_jid,
+        })
+    }
+
+    async fn restart_pairing(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.disconnect_inner().await?;
+        *self.latest_qr.lock().await = None;
+        self.connect_inner().await
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.disconnect_inner().await
     }
 
     async fn send_message(&self, chat_id: &ChatId, text: &str) -> Result<Message> {
@@ -1245,9 +1373,10 @@ impl WhatsAppClient {
         inner.sender = Some(sender);
 
         let client_clone = self.clone();
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             client_clone.read_loop(receiver).await;
         });
+        *self.read_task.lock().await = Some(read_task);
 
         Ok(())
     }
@@ -1366,6 +1495,8 @@ impl WhatsAppClient {
 
         // 9. Persist updated store (including account_identity) to SQLite
         Self::persist_store_static(&store, &client.db_path).await;
+        *client.latest_qr.lock().await = None;
+        *client.state.lock().await = ConnectionState::PairingSucceeded;
 
         // 10. Send pair-device-sign confirmation IQ
         let key_index_val = device_identity_details.key_index.unwrap_or(0);
@@ -1495,7 +1626,13 @@ impl WhatsAppClient {
                                                             engine.encode(&s.identity_key_pub),
                                                             engine.encode(&s.adv_secret.0),
                                                         );
-                                                        tracing::info!("QR ref received from server: {}", ref_str);
+                                                        tracing::info!("QR pairing reference received from server");
+                                                        let created_at_ms = std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default()
+                                                            .as_millis() as u64;
+                                                        *self.latest_qr.lock().await =
+                                                            Some((qr_data.clone(), created_at_ms));
                                                         let _ = event_tx.send(WhatsAppEvent::QrCode(qr_data));
                                                         break; // Display only first QR
                                                     }
@@ -1695,6 +1832,8 @@ impl WhatsAppClient {
                                             }
                                         }
                                         Self::persist_store_static(&store, &db_path).await;
+                                        *state.lock().await = ConnectionState::Connected;
+                                        *self.latest_qr.lock().await = None;
                                         let _ = event_tx.send(WhatsAppEvent::Connected { jid });
                                     } else {
                                         tracing::warn!("Login success but no JID available");
@@ -1720,7 +1859,9 @@ impl WhatsAppClient {
                                     };
                                     tracing::error!("Stream error received: attrs=[{}], content=[{}]",
                                         err_attrs.join(", "), err_children);
-                                    *state.lock().await = ConnectionState::Disconnected;
+                                    if *state.lock().await != ConnectionState::PairingSucceeded {
+                                        *state.lock().await = ConnectionState::Disconnected;
+                                    }
                                     let _ = event_tx.send(WhatsAppEvent::Disconnected);
                                     break;
                                 }
@@ -1773,7 +1914,9 @@ impl WhatsAppClient {
                 }
                 Err(e) => {
                     tracing::error!("Read loop terminated: {}", e);
-                    *state.lock().await = ConnectionState::Disconnected;
+                    if *state.lock().await != ConnectionState::PairingSucceeded {
+                        *state.lock().await = ConnectionState::Disconnected;
+                    }
                     let _ = event_tx.send(WhatsAppEvent::Disconnected);
                     break;
                 }
@@ -2173,5 +2316,71 @@ impl WhatsAppClient {
             }
             None => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::WhatsAppClient;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_read_loop_aborts_and_awaits_the_previous_task() {
+        let client = WhatsAppClient::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_marker = DropMarker(dropped.clone());
+        let task = tokio::spawn(async move {
+            let _task_marker = task_marker;
+            std::future::pending::<()>().await;
+        });
+        *client.read_task.lock().await = Some(task);
+
+        client.stop_read_loop().await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(client.read_task.lock().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplicate_clients_cannot_own_the_same_session_lock() {
+        let db_path = std::env::temp_dir().join(format!(
+            "whatsapp-mcp-session-lock-{}.db",
+            std::process::id()
+        ));
+        let db_path = db_path.to_string_lossy().into_owned();
+        let lock_path = format!("{db_path}.session.lock");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let first = WhatsAppClient::with_db_path(&db_path);
+        first.acquire_session_lock().await.expect("first lock owner");
+
+        let second = WhatsAppClient::with_db_path(&db_path);
+        let error = second
+            .acquire_session_lock()
+            .await
+            .expect_err("duplicate process must be rejected");
+        assert!(error.to_string().contains("already owned"));
+
+        drop(first);
+        second
+            .acquire_session_lock()
+            .await
+            .expect("lock becomes available after owner exits");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&lock_path);
     }
 }
