@@ -171,16 +171,21 @@ async fn main() -> anyhow::Result<()> {
         match tokio::time::timeout(login_timeout, async {
             loop {
                 match client.next_event().await {
-                    Some(WhatsAppEvent::Connected { jid }) => {
-                        eprintln!("✅ Login successful! Connected as: {}", jid);
-                        return true;
-                    }
-                    Some(WhatsAppEvent::Disconnected) => {
-                        eprintln!("⚠️  Disconnected during login");
-                        return false;
-                    }
-                    Some(other) => {
-                        eprintln!("   Event during login: {:?}", other);
+                    Some(event) => {
+                        if let Err(error) = persist_whatsapp_event(&storage, &event).await {
+                            eprintln!("⚠️  Failed to persist WhatsApp login event: {}", error);
+                        }
+                        match event {
+                            WhatsAppEvent::Connected { jid } => {
+                                eprintln!("✅ Login successful! Connected as: {}", jid);
+                                return true;
+                            }
+                            WhatsAppEvent::Disconnected => {
+                                eprintln!("⚠️  Disconnected during login");
+                                return false;
+                            }
+                            other => eprintln!("   Event during login: {:?}", other),
+                        }
                     }
                     None => {
                         eprintln!("⚠️  Event channel closed during login");

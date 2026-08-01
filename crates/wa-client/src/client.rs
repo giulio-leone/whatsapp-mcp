@@ -652,6 +652,31 @@ impl WhatsAppClient {
         Ok(())
     }
 
+    /// Activate or suspend server-side event delivery after login.
+    /// WhatsApp login payloads start passive and must be switched to active
+    /// before history sync and live events are delivered.
+    pub async fn set_passive(&self, passive: bool) -> Result<()> {
+        let id = format!("{:x}", rand::random::<u64>());
+        let child_tag = if passive { "passive" } else { "active" };
+        let iq = Node::new(
+            "iq",
+            IntoIterator::into_iter([
+                ("id".to_string(), AttrValue::String(id)),
+                ("to".to_string(), AttrValue::String("s.whatsapp.net".to_string())),
+                ("type".to_string(), AttrValue::String("set".to_string())),
+                ("xmlns".to_string(), AttrValue::String("passive".to_string())),
+            ])
+            .collect(),
+            Content::Nodes(vec![Node::new(
+                child_tag,
+                HashMap::new(),
+                Content::None,
+            )]),
+        );
+        self.send_iq(iq).await?;
+        Ok(())
+    }
+
     /// Send a read receipt for a message. Blocked in stealth mode (no blue ticks).
     pub async fn send_read_receipt(&self, chat_jid: &str, msg_id: &str) -> Result<()> {
         if self.is_stealth() {
@@ -1873,7 +1898,14 @@ impl WhatsAppClient {
                                         Self::persist_store_static(&store, &db_path).await;
                                         *state.lock().await = ConnectionState::Connected;
                                         *self.latest_qr.lock().await = None;
-                                        let _ = event_tx.send(WhatsAppEvent::Connected { jid });
+                                        let client = self.clone();
+                                        let connected_events = event_tx.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(error) = client.set_passive(false).await {
+                                                tracing::warn!("Failed to activate WhatsApp event delivery: {}", error);
+                                            }
+                                            let _ = connected_events.send(WhatsAppEvent::Connected { jid });
+                                        });
                                     } else {
                                         tracing::warn!("Login success but no JID available");
                                         // Still emit Connected with empty JID so the caller unblocks
