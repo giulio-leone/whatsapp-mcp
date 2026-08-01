@@ -23,6 +23,9 @@ async fn main() -> anyhow::Result<()> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         format!("{}/.whatsapp-mcp/whatsapp.db", home)
     });
+    let replace_existing_session = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--replace-existing-session");
 
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
@@ -32,9 +35,16 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("🔐 WhatsApp Pairing Tool");
     eprintln!("   DB path: {}", db_path);
 
-    // Delete old store for fresh pairing
+    // Re-pairing is destructive. Never delete a store without the explicit
+    // recovery flag; normal first-time setup now happens inside Codex.
     if std::path::Path::new(&db_path).exists() {
-        eprintln!("   Removing old session for fresh pairing...");
+        if !replace_existing_session {
+            return Err(anyhow::anyhow!(
+                "Refusing to delete existing database at {}. Back it up, verify WA_DB_PATH, then re-run with --replace-existing-session if destructive re-pairing is intended.",
+                db_path
+            ));
+        }
+        eprintln!("   Explicit replacement requested; removing existing database...");
         std::fs::remove_file(&db_path)?;
     }
 

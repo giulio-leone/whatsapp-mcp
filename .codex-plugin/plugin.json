@@ -1,0 +1,37 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "0.1.0+codex.local-20260718-234740",
+  "description": "Use WhatsApp from Codex through a native Rust MCP server.",
+  "author": {
+    "name": "Giulio Leone"
+  },
+  "homepage": "https://github.com/giulio-leone/whatsapp-mcp",
+  "repository": "https://github.com/giulio-leone/whatsapp-mcp",
+  "license": "MIT",
+  "keywords": [
+    "whatsapp",
+    "mcp",
+    "codex",
+    "rust",
+    "messaging"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "WhatsApp MCP",
+    "shortDescription": "Read WhatsApp chats and send approved messages",
+    "longDescription": "Connect Codex to WhatsApp through a native Rust MCP server with local SQLite session storage, private in-Codex QR pairing, read-only chat tools, and explicit write safety metadata.",
+    "developerName": "Giulio Leone",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Open the WhatsApp pairing setup.",
+      "Check my WhatsApp connection status.",
+      "List my recent WhatsApp chats."
+    ]
+  }
+}

@@ -3,8 +3,7 @@
 target/
 bridge/wa-bridge
 
-# Cargo lock (library — regenerated on build)
-Cargo.lock
+# Cargo.lock is tracked because this repository ships executable binaries.
 
 # Editor swap files
 **/*.rs.bk

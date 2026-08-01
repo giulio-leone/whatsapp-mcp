@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "./scripts/run-mcp.sh",
+      "cwd": ".",
+      "env": {
+        "WA_DB_PATH": "/Users/giulioleone/.whatsapp-mcp/whatsapp-codex.db"
+      }
+    }
+  }
+}

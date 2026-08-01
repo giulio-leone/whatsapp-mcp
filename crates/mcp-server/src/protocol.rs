@@ -5,6 +5,22 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+pub const MODERN_META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub const MODERN_META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+pub const MODERN_META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const MODERN_META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] =
+    [MODERN_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolEra {
+    Legacy,
+    Modern,
+}
+
 // ─── JSON-RPC 2.0 Envelope ──────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,15 +62,20 @@ impl JsonRpcResponse {
     }
 
     pub fn error(id: Option<serde_json::Value>, code: i32, message: String) -> Self {
+        Self::error_with_data(id, code, message, None)
+    }
+
+    pub fn error_with_data(
+        id: Option<serde_json::Value>,
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0".into(),
             id: id.unwrap_or(serde_json::Value::Null),
             result: None,
-            error: Some(JsonRpcError {
-                code,
-                message,
-                data: None,
-            }),
+            error: Some(JsonRpcError { code, message, data }),
         }
     }
 }
@@ -72,6 +93,8 @@ pub struct ServerInfo {
 pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcesCapability>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,10 +105,32 @@ pub struct ToolsCapability {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ResourcesCapability {
+    pub subscribe: bool,
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    pub annotations: ToolAnnotations,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    pub title: String,
+    pub read_only_hint: bool,
+    pub destructive_hint: bool,
+    pub idempotent_hint: bool,
+    pub open_world_hint: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,6 +144,10 @@ pub struct ToolResultContent {
 #[serde(rename_all = "camelCase")]
 pub struct ToolResult {
     pub content: Vec<ToolResultContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
