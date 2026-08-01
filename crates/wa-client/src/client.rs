@@ -22,6 +22,13 @@ use wa_domain::models::chat::{Chat, ChatId};
 use wa_domain::models::message::{Message, MessageId};
 use crate::crypto::session::Session;
 
+const WA_WEB_VERSION: (u32, u32, u32) = (2, 3000, 1043636855);
+const WA_WEB_VERSION_STRING: &str = "2.3000.1043636855";
+
+fn wa_web_build_hash() -> Vec<u8> {
+    md5::compute(WA_WEB_VERSION_STRING).0.to_vec()
+}
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
@@ -1224,7 +1231,7 @@ impl WhatsAppClient {
         let encrypted_pubkey = inner.noise.encrypt(&pub_key_bytes)?;
         inner.noise.mix_shared_secret_into_key(&priv_key_bytes, &server_ephemeral_arr)?;
 
-        // Version must match whatsmeow: {2, 3000, 1035920091}
+        // WhatsApp rejects stale registration payload versions before issuing a QR.
         let mut client_payload = ClientPayload {
             username: None, // Only set for login (not registration) — whatsmeow: getLoginPayload only
             passive: Some(false),
@@ -1234,9 +1241,9 @@ impl WhatsAppClient {
                 platform: Some(crate::proto::wa_web_protobufs_wa6::client_payload::user_agent::Platform::Web.into()),
                 release_channel: Some(crate::proto::wa_web_protobufs_wa6::client_payload::user_agent::ReleaseChannel::Release.into()),
                 app_version: Some(crate::proto::wa_web_protobufs_wa6::client_payload::user_agent::AppVersion {
-                    primary: Some(2),
-                    secondary: Some(3000),
-                    tertiary: Some(1035920091),
+                    primary: Some(WA_WEB_VERSION.0),
+                    secondary: Some(WA_WEB_VERSION.1),
+                    tertiary: Some(WA_WEB_VERSION.2),
                     ..Default::default()
                 }),
                 mcc: Some("000".to_string()),
@@ -1282,7 +1289,7 @@ impl WhatsAppClient {
                     storage_quota_mb: Some(10240),
                     inline_initial_payload_in_e2_ee_msg: Some(true),
                     recent_sync_days_limit: None,
-                    support_call_log_history: Some(false),
+                    support_call_log_history: Some(true),
                     support_bot_user_agent_chat_history: Some(true),
                     support_cag_reactions_and_polls: Some(true),
                     support_biz_hosted_msg: Some(true),
@@ -1306,7 +1313,6 @@ impl WhatsAppClient {
             use prost::Message;
             let device_props_bytes = device_props.encode_to_vec();
 
-            // BuildHash = md5("2.3000.1035920091")
             client_payload.device_pairing_data = Some(crate::proto::wa_web_protobufs_wa6::client_payload::DevicePairingRegistrationData {
                 e_regid: Some(reg_id_bytes.to_vec()),
                 e_keytype: Some(vec![5]),
@@ -1314,7 +1320,7 @@ impl WhatsAppClient {
                 e_skey_id: Some(skey_id_bytes[1..].to_vec()),
                 e_skey_val: Some(store.signed_prekey.pub_key.to_vec()),
                 e_skey_sig: Some(store.signed_prekey.signature.clone()),
-                build_hash: Some(vec![211, 73, 16, 53, 118, 193, 129, 58, 170, 79, 121, 172, 64, 243, 83, 192]),
+                build_hash: Some(wa_web_build_hash()),
                 device_props: Some(device_props_bytes),
                 ..Default::default()
             });

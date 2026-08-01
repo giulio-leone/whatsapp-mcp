@@ -23,7 +23,7 @@ async fn main() {
             app_version: Some(wa_client::proto::wa_web_protobufs_wa6::client_payload::user_agent::AppVersion {
                 primary: Some(2),
                 secondary: Some(3000),
-                tertiary: Some(1035920091),
+                tertiary: Some(1043636855),
                 ..Default::default()
             }),
             mcc: Some("000".to_string()),
@@ -67,7 +67,7 @@ async fn main() {
             storage_quota_mb: Some(10240),
             inline_initial_payload_in_e2_ee_msg: Some(true),
             recent_sync_days_limit: None,
-            support_call_log_history: Some(false),
+            support_call_log_history: Some(true),
             support_bot_user_agent_chat_history: Some(true),
             support_cag_reactions_and_polls: Some(true),
             support_biz_hosted_msg: Some(true),
@@ -97,7 +97,7 @@ async fn main() {
         e_skey_id: Some(skey_id_bytes[1..].to_vec()),
         e_skey_val: Some(g.signed_prekey.pub_key.to_vec()),
         e_skey_sig: Some(g.signed_prekey.signature.clone()),
-        build_hash: Some(vec![211, 73, 16, 53, 118, 193, 129, 58, 170, 79, 121, 172, 64, 243, 83, 192]),
+        build_hash: Some(vec![169, 42, 162, 77, 77, 252, 167, 78, 120, 173, 221, 231, 180, 125, 17, 152]),
         device_props: Some(device_props_bytes),
     });
     client_payload.passive = Some(false);
