@@ -24,6 +24,7 @@ use crate::crypto::session::Session;
 
 const WA_WEB_VERSION: (u32, u32, u32) = (2, 3000, 1043636855);
 const WA_WEB_VERSION_STRING: &str = "2.3000.1043636855";
+const CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(25);
 
 fn wa_web_build_hash() -> Vec<u8> {
     md5::compute(WA_WEB_VERSION_STRING).0.to_vec()
@@ -244,7 +245,17 @@ impl WhatsAppClient {
         *self.state.lock().await = ConnectionState::Connecting;
 
         let mut inner = self.inner.lock().await;
-        match self.connect_internal(&mut inner).await {
+        inner.sender = None;
+        let connection_result = match timeout(
+            CONNECTION_ATTEMPT_TIMEOUT,
+            self.connect_internal(&mut inner),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("WhatsApp connection attempt timed out")),
+        };
+        match connection_result {
             Ok(()) => {
                 // The Noise handshake is complete, but the WhatsApp session is
                 // not usable until the read loop receives a login success.
@@ -306,7 +317,9 @@ impl WhatsAppClientPort for WhatsAppClient {
 
     async fn restart_pairing(&self) -> Result<()> {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        self.disconnect_inner().await?;
+        if *self.state.lock().await != ConnectionState::Disconnected {
+            self.disconnect_inner().await?;
+        }
         *self.latest_qr.lock().await = None;
         self.connect_inner().await
     }

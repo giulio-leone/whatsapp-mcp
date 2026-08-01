@@ -1229,6 +1229,8 @@ mod tests {
         assert!(PAIRING_WIDGET_HTML.contains("ui/initialize"));
         assert!(PAIRING_WIDGET_HTML.contains("ui/notifications/initialized"));
         assert!(PAIRING_WIDGET_HTML.contains("tools/call"));
+        assert!(PAIRING_WIDGET_HTML.contains("RPC_TIMEOUT_MS"));
+        assert!(PAIRING_WIDGET_HTML.contains("Nessuna sessione salvata è stata cancellata"));
         assert!(!PAIRING_WIDGET_HTML.contains("https://"));
         assert!(!PAIRING_WIDGET_HTML.contains("http://"));
     }

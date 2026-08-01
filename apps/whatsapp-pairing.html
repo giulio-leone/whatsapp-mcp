@@ -141,6 +141,7 @@
       let pollTimer = null;
       let retryBusy = false;
       const pending = new Map();
+      const RPC_TIMEOUT_MS = 25000;
 
       const labels = {
         preparing: "Preparazione del codice",
@@ -160,7 +161,11 @@
 
       const request = (method, params) => new Promise((resolve, reject) => {
         const id = ++rpcId;
-        pending.set(id, { resolve, reject });
+        const timer = window.setTimeout(() => {
+          if (!pending.delete(id)) return;
+          reject(new Error(`${method} timed out`));
+        }, RPC_TIMEOUT_MS);
+        pending.set(id, { resolve, reject, timer });
         window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
       });
 
@@ -196,6 +201,9 @@
         dotEl.dataset.phase = phase;
         qrPanelEl.dataset.visible = String(hasQr);
         retryEl.dataset.visible = String(Boolean(structured.canRetry));
+        retryEl.textContent = phase === "session_disconnected"
+          ? "Riconnetti la sessione"
+          : "Genera un nuovo codice";
         retryEl.disabled = retryBusy;
         expiresAtMs = Number.isFinite(meta.qrExpiresAtMs) ? meta.qrExpiresAtMs : null;
       };
@@ -224,6 +232,7 @@
           const waiter = pending.get(message.id);
           if (!waiter) return;
           pending.delete(message.id);
+          window.clearTimeout(waiter.timer);
           if (message.error) waiter.reject(message.error);
           else waiter.resolve(message.result);
           return;
@@ -269,10 +278,30 @@
 
       retryEl.addEventListener("click", async () => {
         if (retryBusy) return;
+        const reconnectingSavedSession = current?.structuredContent?.phase === "session_disconnected";
         retryBusy = true;
+        current = {
+          structuredContent: {
+            phase: "preparing",
+            hasQr: false,
+            canRetry: false,
+            message: reconnectingSavedSession
+              ? "Riconnessione della sessione salvata…"
+              : "Generazione di un nuovo codice…",
+          },
+        };
         render();
         try {
           await callTool("restart_pairing");
+        } catch {
+          current = {
+            structuredContent: {
+              phase: "error",
+              hasQr: false,
+              canRetry: true,
+              message: "Tentativo non riuscito. Nessuna sessione salvata è stata cancellata; riprova.",
+            },
+          };
         } finally {
           retryBusy = false;
           render();

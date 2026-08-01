@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-mcp",
-  "version": "0.1.0+codex.local-20260801-135806",
+  "version": "0.1.0+codex.local-20260801-150602",
   "description": "Use WhatsApp from Codex through a native Rust MCP server.",
   "author": {
     "name": "Giulio Leone"
