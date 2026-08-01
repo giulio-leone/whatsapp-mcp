@@ -4,7 +4,7 @@
       "command": "./scripts/run-mcp.sh",
       "cwd": ".",
       "env": {
-        "WA_DB_PATH": "/Users/giulioleone/.whatsapp-mcp/whatsapp-codex.db"
+        "WA_DB_PATH": "/Users/giulioleone/.whatsapp-mcp/whatsapp-codex-20260801.db"
       }
     }
   }
