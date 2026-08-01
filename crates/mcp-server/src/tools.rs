@@ -2,14 +2,71 @@
 //!
 //! Consolidated, intent-based tools following Anthropic's best practices:
 //!
-//! - **Few tools, clear purpose**: 6 tools covering the full WhatsApp surface.
+//! - **Few tools, clear purpose**: 9 tools covering WhatsApp plus private setup UI.
 //! - **"Job-to-be-Done" design**: Each tool is one user intent, not one API call.
 //! - **Exclusionary guidance**: Descriptions say when NOT to use a tool.
 //! - **ToolAnnotations**: readOnly/destructive/idempotent/openWorld hints.
 //! - **Cursor-based pagination**: Deterministic, prevents hallucination.
 
-use crate::protocol::ToolDefinition;
+use crate::protocol::{ToolAnnotations, ToolDefinition};
 use serde_json::json;
+
+pub const PAIRING_RESOURCE_URI: &str = "ui://widget/whatsapp-pairing-v1.html";
+
+fn read_only_annotations(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.into(),
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: true,
+    }
+}
+
+fn send_annotations() -> ToolAnnotations {
+    ToolAnnotations {
+        title: "Send WhatsApp message".into(),
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: false,
+        open_world_hint: true,
+    }
+}
+
+fn restart_pairing_annotations() -> ToolAnnotations {
+    ToolAnnotations {
+        title: "Retry WhatsApp pairing".into(),
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: true,
+    }
+}
+
+fn pairing_meta(visibility: &[&str]) -> serde_json::Value {
+    json!({
+        "ui": {
+            "resourceUri": PAIRING_RESOURCE_URI,
+            "visibility": visibility,
+        },
+        "openai/outputTemplate": PAIRING_RESOURCE_URI,
+    })
+}
+
+fn pairing_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "phase": { "type": "string" },
+            "connected": { "type": "boolean" },
+            "hasQr": { "type": "boolean" },
+            "canRetry": { "type": "boolean" },
+            "message": { "type": "string" }
+        },
+        "required": ["phase", "connected", "hasQr", "canRetry", "message"],
+        "additionalProperties": false
+    })
+}
 
 /// Returns the full list of tools this MCP server exposes.
 ///
@@ -48,6 +105,9 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
+            annotations: read_only_annotations("List WhatsApp chats"),
+            meta: None,
         },
 
         ToolDefinition {
@@ -81,6 +141,9 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["chat_id"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            annotations: read_only_annotations("Get WhatsApp messages"),
+            meta: None,
         },
 
         ToolDefinition {
@@ -102,6 +165,9 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            annotations: read_only_annotations("Search WhatsApp contacts"),
+            meta: None,
         },
 
         ToolDefinition {
@@ -123,6 +189,9 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["chat_id"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            annotations: read_only_annotations("Get WhatsApp chat info"),
+            meta: None,
         },
 
         // ─── STATE-MUTATING TOOLS ───────────────────────────────────
@@ -151,6 +220,9 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "required": ["chat_id", "text"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            annotations: send_annotations(),
+            meta: None,
         },
 
         // ─── UTILITY TOOLS ──────────────────────────────────────────
@@ -159,7 +231,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             name: "get_connection_status".into(),
             description: concat!(
                 "Check the current WhatsApp connection status. ",
-                "Returns whether the client is connected, the authenticated phone number, and session health. ",
+                "Returns whether the client is connected and its session health. ",
                 "Use this to diagnose issues when other tools return connection errors. ",
                 "Do NOT use this to list chats or messages.",
             ).into(),
@@ -168,6 +240,124 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "properties": {},
                 "additionalProperties": false
             }),
+            output_schema: None,
+            annotations: read_only_annotations("Check WhatsApp connection"),
+            meta: None,
+        },
+
+        ToolDefinition {
+            name: "open_pairing".into(),
+            description: concat!(
+                "Open the private WhatsApp pairing setup in Codex. ",
+                "Use when the user asks to connect, pair, scan a QR code, or inspect setup state. ",
+                "The QR is rendered only inside the app and is never returned to the model. ",
+                "This tool never deletes or replaces an existing WhatsApp session."
+            ).into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            output_schema: Some(pairing_output_schema()),
+            annotations: read_only_annotations("Open WhatsApp pairing"),
+            meta: Some(pairing_meta(&["model", "app"])),
+        },
+
+        ToolDefinition {
+            name: "get_pairing_status".into(),
+            description: "Read the current WhatsApp first-setup pairing state for the pairing app.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            output_schema: Some(pairing_output_schema()),
+            annotations: read_only_annotations("Read WhatsApp pairing status"),
+            meta: Some(pairing_meta(&["app"])),
+        },
+
+        ToolDefinition {
+            name: "restart_pairing".into(),
+            description: concat!(
+                "Retry a stalled first-time WhatsApp pairing attempt when no saved session exists, or retry reconnection for a disconnected saved session while preserving the database and session. ",
+                "Available only to the pairing app. ",
+                "Destructive session replacement is unavailable through MCP and requires the explicit legacy `--replace-existing-session` flag."
+            ).into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            output_schema: Some(pairing_output_schema()),
+            annotations: restart_pairing_annotations(),
+            meta: Some(pairing_meta(&["app"])),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_exposes_codex_safety_annotations() {
+        let tools = tool_registry();
+        assert_eq!(tools.len(), 9);
+
+        for tool in tools
+            .iter()
+            .filter(|tool| tool.name != "send_message" && tool.name != "restart_pairing")
+        {
+            assert!(
+                tool.annotations.read_only_hint,
+                "{} must be read-only",
+                tool.name
+            );
+            assert!(
+                !tool.annotations.destructive_hint,
+                "{} must be non-destructive",
+                tool.name
+            );
+            assert!(
+                tool.annotations.idempotent_hint,
+                "{} must be idempotent",
+                tool.name
+            );
+            assert!(
+                tool.annotations.open_world_hint,
+                "{} uses WhatsApp",
+                tool.name
+            );
+        }
+
+        let send = tools
+            .iter()
+            .find(|tool| tool.name == "send_message")
+            .expect("send_message tool");
+        assert!(!send.annotations.read_only_hint);
+        assert!(send.annotations.destructive_hint);
+        assert!(!send.annotations.idempotent_hint);
+        assert!(send.annotations.open_world_hint);
+
+        let restart = tools
+            .iter()
+            .find(|tool| tool.name == "restart_pairing")
+            .expect("restart_pairing tool");
+        assert!(!restart.annotations.read_only_hint);
+        assert!(!restart.annotations.destructive_hint);
+        assert!(restart.annotations.idempotent_hint);
+        assert_eq!(restart.meta.as_ref().unwrap()["ui"]["visibility"][0], "app");
+
+        let pairing = tools
+            .iter()
+            .find(|tool| tool.name == "open_pairing")
+            .expect("open_pairing tool");
+        assert_eq!(pairing.meta.as_ref().unwrap()["ui"]["resourceUri"], PAIRING_RESOURCE_URI);
+
+        let wire = serde_json::to_value(send).expect("serialize tool");
+        assert_eq!(wire["annotations"]["readOnlyHint"], false);
+        assert_eq!(wire["annotations"]["destructiveHint"], true);
+        assert_eq!(wire["annotations"]["idempotentHint"], false);
+        assert_eq!(wire["annotations"]["openWorldHint"], true);
+    }
 }

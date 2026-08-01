@@ -1,0 +1,21 @@
+{
+  "name": "whatsapp-mcp-local",
+  "interface": {
+    "displayName": "WhatsApp MCP Local"
+  },
+  "plugins": [
+    {
+      "name": "whatsapp-mcp",
+      "version": "0.1.0+codex.local-20260801-092136",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

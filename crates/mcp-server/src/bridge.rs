@@ -128,6 +128,12 @@ impl WhatsAppClientPort for BridgeClient {
         }
     }
 
+    async fn is_connected(&self) -> Result<bool> {
+        let status = self.health().await?;
+        Ok(status["connected"].as_bool().unwrap_or(false)
+            && status["logged_in"].as_bool().unwrap_or(false))
+    }
+
     async fn disconnect(&self) -> Result<()> {
         self.rpc("disconnect", json!({})).await?;
         Ok(())

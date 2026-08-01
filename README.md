@@ -15,7 +15,7 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
            │
 ┌──────────▼───────────┐
 │   wa-mcp-server      │  ← MCP protocol handler
-│   (Rust, crates/     │     6 intent-based tools
+│   (Rust, crates/     │     9 intent-based tools + pairing app
 │    mcp-server)       │
 └────┬────────────┬────┘
      │            │
@@ -45,7 +45,7 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
 | `wa-domain` | Shared models (`Chat`, `Message`, `Contact`, `Jid`) and port traits |
 | `wa-client` | WhatsApp Web Multi-Device protocol: Noise handshake, Signal encryption, binary codec |
 | `storage-sqlite` | SQLite persistence for messages, chats, contacts |
-| `mcp-server` | JSON-RPC 2.0 MCP server with 6 LLM-optimized tools |
+| `mcp-server` | JSON-RPC 2.0 MCP server with 9 tools and a private pairing app |
 
 ## MCP Tools
 
@@ -57,6 +57,9 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
 | `get_chat_info` | 🟢 read-only | Get detailed info for a single chat |
 | `send_message` | 🟡 write | Send a text message (requires confirmation) |
 | `get_connection_status` | 🟢 read-only | Check WhatsApp session health |
+| `open_pairing` | 🟢 read-only | Open the private pairing app in Codex |
+| `get_pairing_status` | 🟢 app-only | Poll pairing state without exposing the QR to the model |
+| `restart_pairing` | 🟡 app-only | Retry first-time pairing without a saved session; retry reconnection for a disconnected saved session without replacing the database or session |
 
 ## Quick Start
 
@@ -73,6 +76,41 @@ cargo build --release
 # The server communicates over stdio (JSON-RPC)
 ./target/release/wa-mcp-server
 ```
+
+### MCP protocol eras
+
+The stdio server supports both MCP wire eras:
+
+- Modern `2026-07-28`: probe with `server/discover`, then include
+  `params._meta.io.modelcontextprotocol/protocolVersion` and
+  `params._meta.io.modelcontextprotocol/clientCapabilities` on every request.
+  `clientInfo` is accepted when supplied. Modern results carry server identity
+  in `_meta.io.modelcontextprotocol/serverInfo`.
+- Legacy `2025-06-18`: use the `initialize` / `initialized` handshake. Existing
+  `tools/list` and `tools/call` clients remain supported without modern metadata.
+
+The modern and legacy paths share the same tool registry; the server does not
+enable HTTP transport.
+
+### Install as a Codex plugin
+
+Install from this checkout:
+
+```bash
+codex plugin marketplace add .
+codex plugin add whatsapp-mcp@whatsapp-mcp-local
+```
+
+Or install the marketplace from GitHub:
+
+```bash
+codex plugin marketplace add giulio-leone/whatsapp-mcp --ref main
+codex plugin add whatsapp-mcp@whatsapp-mcp-local
+```
+
+The plugin launcher builds the pinned Rust binary into
+`${XDG_CACHE_HOME:-$HOME/.cache}/whatsapp-mcp` on first use and reuses it on
+later starts. `cargo` must remain available in `PATH`.
 
 ### Configure with Claude Desktop
 
@@ -91,22 +129,49 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
 }
 ```
 
-### First Connection
+### First Connection in Codex
 
-On first launch, the server will display a QR code in stderr.
-Scan it with WhatsApp → Settings → Linked Devices → Link a Device.
+1. Start a new Codex task after installing the plugin.
+2. Ask: `Open the WhatsApp pairing setup.`
+3. In the rendered app, scan the QR from WhatsApp → Settings → Linked Devices →
+   Link a Device.
+4. Keep the app open until it reports `WhatsApp collegato`.
+
+The MCP server exposes the component as an MCP Apps resource
+(`text/html;profile=mcp-app`). The raw QR payload is returned only in MCP tool
+result `_meta`, rendered inside the private app, and never placed in
+model-visible `structuredContent` or `content`. No QR file is written to disk.
+
+The integrated flow supports safe first-time setup and non-destructive recovery.
+When no saved session exists, `restart_pairing` retries first-time pairing. When
+a saved session exists but is disconnected, the same action retries reconnection
+while preserving the database and session. Destructive session replacement
+remains unavailable through MCP and still requires the explicit
+`--replace-existing-session` flag in the legacy terminal utility.
+
+The legacy terminal utility remains available for recovery. It requires the
+explicit `--replace-existing-session` flag before deleting an existing database:
+
+```bash
+cargo run --locked --release --bin wa-pair -- --replace-existing-session
+```
+
+Back up `WA_DB_PATH` first. This recovery command is outside the Codex pairing
+app and replaces the entire local WhatsApp MCP database.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WA_DB_PATH` | `whatsapp.db` | Path to SQLite database |
+| `WA_DB_PATH` | `~/.whatsapp-mcp/whatsapp.db` | Path to SQLite database and encrypted session state |
 | `RUST_LOG` | (none) | Log level (`info`, `debug`, `trace`) |
+| `WHATSAPP_MCP_BUILD_CACHE` | `${XDG_CACHE_HOME:-$HOME/.cache}/whatsapp-mcp` | Plugin build cache override |
 
 ## Project Structure
 
 ```
 whatsapp-mcp/
+├── apps/                    # MCP Apps pairing component
 ├── Cargo.toml              # Workspace root
 ├── crates/
 │   ├── domain/             # Shared models & port traits
@@ -131,11 +196,17 @@ whatsapp-mcp/
 # Check everything compiles
 cargo check --workspace
 
+# Run workspace tests
+cargo test --workspace
+
 # Run with debug logging
 RUST_LOG=debug cargo run --bin wa-mcp-server
 
 # Test MCP protocol
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | cargo run --bin wa-mcp-server
+
+# Modern discovery probe (per-request metadata is required after discovery)
+echo '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}' | cargo run --bin wa-mcp-server
 ```
 
 ## License

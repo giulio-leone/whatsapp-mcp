@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Collega WhatsApp</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --surface: var(--color-background-primary, #ffffff);
+        --surface-muted: var(--color-background-secondary, #f4f7f5);
+        --text: var(--color-text-primary, #15211b);
+        --muted: var(--color-text-secondary, #617068);
+        --border: var(--color-border-default, #dce5df);
+        --accent: #178c55;
+        --accent-strong: #0f6f42;
+        --danger: #a33b30;
+      }
+
+      * { box-sizing: border-box; }
+      html, body { margin: 0; min-height: 100%; }
+      body { padding: 16px; background: var(--surface); color: var(--text); }
+
+      main {
+        width: min(100%, 520px);
+        margin: 0 auto;
+        display: grid;
+        gap: 16px;
+      }
+
+      header { display: flex; align-items: center; gap: 12px; }
+      .mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 13px;
+        display: grid;
+        place-items: center;
+        color: white;
+        background: linear-gradient(145deg, #25d366, var(--accent-strong));
+        font-weight: 800;
+        letter-spacing: -0.05em;
+      }
+      h1 { margin: 0; font-size: 1.2rem; line-height: 1.2; }
+      .subtitle { margin: 3px 0 0; color: var(--muted); font-size: 0.88rem; }
+
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        background: var(--surface-muted);
+        padding: 18px;
+      }
+
+      .status-row { display: flex; align-items: center; gap: 9px; }
+      .dot { width: 9px; height: 9px; border-radius: 999px; background: #8c9a92; }
+      .dot[data-phase="connected"] { background: #1aa260; box-shadow: 0 0 0 4px rgba(26, 162, 96, 0.13); }
+      .dot[data-phase="awaiting_scan"] { background: #d49a18; box-shadow: 0 0 0 4px rgba(212, 154, 24, 0.13); }
+      .dot[data-phase="expired"], .dot[data-phase="error"] { background: var(--danger); }
+      #status-title { font-weight: 700; }
+      #status-message { margin: 9px 0 0; color: var(--muted); line-height: 1.45; }
+
+      #qr-panel { display: none; text-align: center; }
+      #qr-panel[data-visible="true"] { display: grid; gap: 12px; justify-items: center; }
+      .qr-shell {
+        width: min(100%, 310px);
+        aspect-ratio: 1;
+        padding: 15px;
+        border-radius: 18px;
+        background: #fff;
+        border: 1px solid #d9e3dc;
+      }
+      canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+      .steps { margin: 0; padding-left: 1.35rem; text-align: left; line-height: 1.6; }
+      .timer { color: var(--muted); font-size: 0.84rem; font-variant-numeric: tabular-nums; }
+
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 12px;
+        background: var(--accent);
+        color: #fff;
+        padding: 10px 15px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:hover { background: var(--accent-strong); }
+      button:disabled { opacity: 0.55; cursor: wait; }
+      #retry { display: none; margin-top: 14px; }
+      #retry[data-visible="true"] { display: inline-block; }
+      .privacy { margin: 0; color: var(--muted); font-size: 0.78rem; line-height: 1.45; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="mark" aria-hidden="true">WA</div>
+        <div>
+          <h1>Collega WhatsApp a Codex</h1>
+          <p class="subtitle">Pairing locale, sessione salvata sul tuo computer</p>
+        </div>
+      </header>
+
+      <section class="card" aria-live="polite">
+        <div class="status-row">
+          <span id="dot" class="dot"></span>
+          <span id="status-title">Preparazione…</span>
+        </div>
+        <p id="status-message">Apro un canale sicuro per il primo collegamento.</p>
+        <button id="retry" type="button">Genera un nuovo codice</button>
+      </section>
+
+      <section id="qr-panel" class="card" aria-label="Codice QR WhatsApp">
+        <div class="qr-shell"><canvas id="qr" width="320" height="320"></canvas></div>
+        <ol class="steps">
+          <li>Apri WhatsApp sul telefono.</li>
+          <li>Vai in <strong>Impostazioni → Dispositivi collegati</strong>.</li>
+          <li>Tocca <strong>Collega un dispositivo</strong> e scansiona il codice.</li>
+        </ol>
+        <div id="timer" class="timer"></div>
+      </section>
+
+      <p class="privacy">
+        Il contenuto del QR resta nel componente privato e non viene mostrato al modello.
+        Una sessione già salvata non viene cancellata o sostituita da questa schermata.
+      </p>
+    </main>
+
+    <script type="module">
+      const titleEl = document.querySelector("#status-title");
+      const messageEl = document.querySelector("#status-message");
+      const dotEl = document.querySelector("#dot");
+      const qrPanelEl = document.querySelector("#qr-panel");
+      const canvasEl = document.querySelector("#qr");
+      const timerEl = document.querySelector("#timer");
+      const retryEl = document.querySelector("#retry");
+
+      let rpcId = 0;
+      let current = null;
+      let expiresAtMs = null;
+      let pollTimer = null;
+      let retryBusy = false;
+      const pending = new Map();
+
+      const labels = {
+        preparing: "Preparazione del codice",
+        awaiting_scan: "In attesa della scansione",
+        paired: "Pairing completato",
+        connected: "WhatsApp collegato",
+        expired: "Codice scaduto",
+        disconnected: "Sessione non configurata",
+        session_disconnected: "Sessione salvata, ma offline",
+        unsupported: "Pairing non disponibile",
+        error: "Errore di pairing",
+      };
+
+      const notify = (method, params) => {
+        window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+      };
+
+      const request = (method, params) => new Promise((resolve, reject) => {
+        const id = ++rpcId;
+        pending.set(id, { resolve, reject });
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+      });
+
+      const drawQr = (qr) => {
+        if (!qr || !Number.isInteger(qr.size) || typeof qr.modules !== "string") return false;
+        if (qr.modules.length !== qr.size * qr.size) return false;
+        const context = canvasEl.getContext("2d", { alpha: false });
+        const quiet = 4;
+        const total = qr.size + quiet * 2;
+        const scale = Math.max(1, Math.floor(canvasEl.width / total));
+        const rendered = total * scale;
+        const offset = Math.floor((canvasEl.width - rendered) / 2);
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, canvasEl.width, canvasEl.height);
+        context.fillStyle = "#111111";
+        for (let y = 0; y < qr.size; y += 1) {
+          for (let x = 0; x < qr.size; x += 1) {
+            if (qr.modules[y * qr.size + x] === "1") {
+              context.fillRect(offset + (x + quiet) * scale, offset + (y + quiet) * scale, scale, scale);
+            }
+          }
+        }
+        return true;
+      };
+
+      const render = () => {
+        const structured = current?.structuredContent ?? {};
+        const meta = current?._meta ?? {};
+        const phase = structured.phase ?? "preparing";
+        const hasQr = Boolean(structured.hasQr && drawQr(meta.qr));
+        titleEl.textContent = labels[phase] ?? "Stato pairing";
+        messageEl.textContent = structured.message ?? "Aggiornamento dello stato…";
+        dotEl.dataset.phase = phase;
+        qrPanelEl.dataset.visible = String(hasQr);
+        retryEl.dataset.visible = String(Boolean(structured.canRetry));
+        retryEl.disabled = retryBusy;
+        expiresAtMs = Number.isFinite(meta.qrExpiresAtMs) ? meta.qrExpiresAtMs : null;
+      };
+
+      const updateTimer = () => {
+        if (!expiresAtMs || qrPanelEl.dataset.visible !== "true") {
+          timerEl.textContent = "";
+          return;
+        }
+        const seconds = Math.max(0, Math.ceil((expiresAtMs - Date.now()) / 1000));
+        timerEl.textContent = seconds > 0 ? `Codice valido ancora per circa ${seconds}s` : "Codice in scadenza…";
+      };
+
+      const applyToolResult = (result) => {
+        if (!result || typeof result !== "object") return;
+        current = result;
+        render();
+        updateTimer();
+      };
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.jsonrpc !== "2.0") return;
+        if (message.id !== undefined) {
+          const waiter = pending.get(message.id);
+          if (!waiter) return;
+          pending.delete(message.id);
+          if (message.error) waiter.reject(message.error);
+          else waiter.resolve(message.result);
+          return;
+        }
+        if (message.method === "ui/notifications/tool-result") applyToolResult(message.params);
+      }, { passive: true });
+
+      const bridgeReady = (async () => {
+        await request("ui/initialize", {
+          appInfo: { name: "whatsapp-pairing", version: "0.1.0" },
+          appCapabilities: {},
+          protocolVersion: "2026-01-26",
+        });
+        notify("ui/notifications/initialized", {});
+      })();
+
+      const callTool = async (name) => {
+        await bridgeReady;
+        const result = await request("tools/call", { name, arguments: {} });
+        applyToolResult(result);
+      };
+
+      const poll = async () => {
+        try {
+          await callTool("get_pairing_status");
+        } catch {
+          current = {
+            structuredContent: {
+              phase: "error",
+              hasQr: false,
+              canRetry: false,
+              message: "Codex non riesce a leggere lo stato del pairing. Riapri il plugin in una nuova attività.",
+            },
+          };
+          render();
+        } finally {
+          const phase = current?.structuredContent?.phase;
+          if (phase !== "connected" && phase !== "unsupported") {
+            pollTimer = window.setTimeout(poll, 2500);
+          }
+        }
+      };
+
+      retryEl.addEventListener("click", async () => {
+        if (retryBusy) return;
+        retryBusy = true;
+        render();
+        try {
+          await callTool("restart_pairing");
+        } finally {
+          retryBusy = false;
+          render();
+        }
+      });
+
+      window.addEventListener("pagehide", () => {
+        if (pollTimer) window.clearTimeout(pollTimer);
+      });
+
+      window.setInterval(updateTimer, 1000);
+      poll();
+    </script>
+  </body>
+</html>
