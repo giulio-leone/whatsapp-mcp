@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let storage = SqliteStorage::new(&db_path)?;
 
     // Phase 1: QR pairing
+    let mut generated_qr_paths = Vec::new();
     let paired_jid = loop {
         eprintln!("   Connecting to WhatsApp Web...\n");
         let client = WhatsAppClient::with_db_path(&db_path);
@@ -79,12 +80,14 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Some(event)) => match event {
                     WhatsAppEvent::QrCode(data) => {
                         // Save QR as PNG file and auto-open with Preview
-                        let qr_path = format!("{}/qr_code.png", 
+                        let qr_path = format!("{}/qr_code-{}.png",
                             std::path::Path::new(&db_path).parent()
                                 .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|| ".".to_string()));
+                                .unwrap_or_else(|| ".".to_string()),
+                            chrono::Utc::now().timestamp_millis());
                         match save_qr_png(&data, &qr_path) {
                             Ok(()) => {
+                                generated_qr_paths.push(qr_path.clone());
                                 eprintln!("📱 QR code saved to: {}", qr_path);
                                 eprintln!("   Opening with Preview...");
                                 let _ = std::process::Command::new("open").arg(&qr_path).spawn();
@@ -133,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     };
+    for qr_path in generated_qr_paths {
+        let _ = std::fs::remove_file(qr_path);
+    }
 
     // Phase 2: Login reconnection with saved credentials
     eprintln!();
