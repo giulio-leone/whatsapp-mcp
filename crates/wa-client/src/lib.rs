@@ -41,6 +41,24 @@ pub mod proto {
     pub mod wa_mms_retry {
         include!(concat!(env!("OUT_DIR"), "/wa_mms_retry.rs"));
     }
+    pub mod wa_web_protobufs_history_sync {
+        include!(concat!(env!("OUT_DIR"), "/wa_web_protobufs_history_sync.rs"));
+    }
+    pub mod wa_web_protobufs_web {
+        include!(concat!(env!("OUT_DIR"), "/wa_web_protobufs_web.rs"));
+    }
+    pub mod wa_web_protobuf_sync_action {
+        include!(concat!(env!("OUT_DIR"), "/wa_web_protobuf_sync_action.rs"));
+    }
+    pub mod wa_web_protobufs_chat_lock_settings {
+        include!(concat!(env!("OUT_DIR"), "/wa_web_protobufs_chat_lock_settings.rs"));
+    }
+    pub mod wa_web_protobufs_device_capabilities {
+        include!(concat!(env!("OUT_DIR"), "/wa_web_protobufs_device_capabilities.rs"));
+    }
+    pub mod wa_web_protobufs_user_password {
+        include!(concat!(env!("OUT_DIR"), "/wa_web_protobufs_user_password.rs"));
+    }
     pub mod signal {
         include!(concat!(env!("OUT_DIR"), "/signal.rs"));
     }

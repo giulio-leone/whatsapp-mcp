@@ -137,7 +137,13 @@ impl StoragePort for SqliteStorage {
     async fn save_chat(&self, chat: &Chat) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO chats (id, name, unread_count, is_group, last_message_timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO chats (id, name, unread_count, is_group, last_message_timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = COALESCE(excluded.name, chats.name),
+                 unread_count = MAX(excluded.unread_count, chats.unread_count),
+                 is_group = excluded.is_group,
+                 last_message_timestamp = MAX(excluded.last_message_timestamp, chats.last_message_timestamp)",
             rusqlite::params![
                 chat.id.0,
                 chat.name,

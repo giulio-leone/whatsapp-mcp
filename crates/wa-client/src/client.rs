@@ -90,7 +90,11 @@ pub enum WhatsAppEvent {
     ReceiptReceived { id: String, from: String, timestamp: i64 },
     PresenceUpdate { jid: String, available: bool, last_seen: Option<i64> },
     StatusReceived { from: String, text: Option<String>, media_type: Option<String>, timestamp: i64 },
-    HistorySynced { chat_count: usize },
+    HistorySyncBatch {
+        chats: Vec<Chat>,
+        messages: Vec<Message>,
+        progress: Option<u32>,
+    },
     Disconnected,
 }
 
@@ -1746,6 +1750,7 @@ impl WhatsAppClient {
                                     let participant = node.get_attr("participant").map(|s| s.to_string());
                                     let sender_jid = participant.as_deref().unwrap_or(&from);
 
+                                    let mut history_notification = None;
                                     let text = if let Some(enc_node) = node.get_child_by_tag("enc") {
                                         let enc_type = enc_node.get_attr("type").unwrap_or("");
                                         match &enc_node.content {
@@ -1755,6 +1760,8 @@ impl WhatsAppClient {
                                                         use crate::proto::wa_web_protobufs_e2e as e2e;
                                                         if let Ok(e2e_msg) = prost::Message::decode(&plaintext[..]) {
                                                             let e2e_msg: e2e::Message = e2e_msg;
+                                                            history_notification = e2e_msg.protocol_message
+                                                                .and_then(|message| message.history_sync_notification);
                                                             e2e_msg.conversation.or_else(|| {
                                                                 e2e_msg.extended_text_message.and_then(|m| m.text)
                                                             })
@@ -1783,13 +1790,27 @@ impl WhatsAppClient {
                                         }
                                     };
 
+                                    if let Some(notification) = history_notification {
+                                        let client = self.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(error) = client.process_history_sync_notification(notification).await {
+                                                tracing::warn!("Failed to process WhatsApp history sync: {}", error);
+                                            }
+                                        });
+                                        continue;
+                                    }
+
+                                    let timestamp = node.get_attr("t")
+                                        .and_then(|value| value.parse::<i64>().ok())
+                                        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
                                     let msg = Message {
                                         id: MessageId(id.clone()),
                                         chat_id: ChatId(from.clone()),
                                         sender_id: sender_jid.to_string(),
                                         text: text.clone(),
                                         media: None,
-                                        timestamp: chrono::Utc::now().timestamp(),
+                                        timestamp,
                                         is_from_me: false,
                                         is_forwarded: false,
                                         reply_to_id: None,
@@ -1804,6 +1825,18 @@ impl WhatsAppClient {
                                             timestamp: chrono::Utc::now().timestamp(),
                                         });
                                     } else {
+                                        {
+                                            let mut current_store = store.lock().await;
+                                            if !current_store.chats.contains_key(&from) {
+                                                current_store.add_chat(Chat {
+                                                    id: ChatId(from.clone()),
+                                                    name: None,
+                                                    unread_count: 0,
+                                                    is_group: from.ends_with("@g.us"),
+                                                    last_message_timestamp: timestamp,
+                                                });
+                                            }
+                                        }
                                         let _ = event_tx.send(WhatsAppEvent::MessageReceived(msg));
                                     }
                                 }
@@ -1875,7 +1908,7 @@ impl WhatsAppClient {
                                     let notif_type = node.get_attr("type").unwrap_or("");
                                     tracing::debug!("Notification: type={}", notif_type);
                                     if notif_type == "encrypt" || notif_type == "w:gp2" || notif_type == "server_sync" {
-                                        Self::process_notification(&node, &store, &event_tx).await;
+                                        Self::process_notification(&node, &store).await;
                                     } else if notif_type == "status" {
                                         // Status/story update notification
                                         let from = node.get_attr("participant")
@@ -2019,7 +2052,6 @@ impl WhatsAppClient {
     async fn process_notification(
         node: &Node,
         store: &Arc<Mutex<DeviceStore>>,
-        event_tx: &tokio::sync::mpsc::UnboundedSender<WhatsAppEvent>,
     ) {
         // Look for <set> children with chat info
         for child in node.get_children_by_tag("add").iter()
@@ -2042,59 +2074,152 @@ impl WhatsAppClient {
             }
         }
 
-        // Process history sync blobs (contained in <enc> children within notifications)
-        if let Content::Nodes(children) = &node.content {
-            let mut chat_count = 0usize;
-            for child in children {
-                if child.tag == "enc" || child.tag == "hist_sync_notification" || child.tag == "history" {
-                    if let Content::Bytes(blob) = &child.content {
-                        // Try to decompress (zlib) and extract chat JIDs
-                        let data = Self::try_decompress(blob).unwrap_or_else(|| blob.clone());
-                        // Parse as best-effort: look for JID-like strings in the blob
-                        chat_count += Self::extract_chats_from_sync(&data, store).await;
-                    }
-                }
-            }
-            if chat_count > 0 {
-                tracing::info!("History sync: {} chats loaded", chat_count);
-                let _ = event_tx.send(WhatsAppEvent::HistorySynced { chat_count });
-            }
-        }
     }
 
-    /// Extract chat JIDs from a history sync blob using regex-free binary scanning.
-    /// WhatsApp history sync blobs contain JIDs as UTF-8 strings embedded in protobuf fields.
-    async fn extract_chats_from_sync(
-        data: &[u8],
-        store: &Arc<Mutex<DeviceStore>>,
-    ) -> usize {
-        let text = String::from_utf8_lossy(data);
-        let mut count = 0;
-        let mut s = store.lock().await;
+    async fn process_history_sync_notification(
+        &self,
+        notification: crate::proto::wa_web_protobufs_e2e::HistorySyncNotification,
+    ) -> Result<()> {
+        use base64::Engine as _;
+        use crate::media::{download_and_decrypt_media, MediaType};
+        use crate::proto::wa_web_protobufs_history_sync::HistorySync;
 
-        // Scan for JID patterns: <digits>@s.whatsapp.net or <digits>-<digits>@g.us
-        for segment in text.split(|c: char| c.is_control() || c == '\0') {
-            let trimmed = segment.trim();
-            if (trimmed.ends_with("@s.whatsapp.net") || trimmed.ends_with("@g.us"))
-                && trimmed.len() < 50
-                && trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-            {
-                let jid = trimmed.to_string();
-                let is_group = jid.ends_with("@g.us");
-                if !s.chats.contains_key(&jid) {
-                    let chat = Chat {
-                        id: ChatId(jid.clone()),
-                        name: Some(jid.clone()),
-                        unread_count: 0,
-                        is_group,
-                        last_message_timestamp: chrono::Utc::now().timestamp(),
-                    };
-                    s.add_chat(chat);
-                    count += 1;
+        let compressed = if let Some(inline) = notification
+            .initial_hist_bootstrap_inline_payload
+            .filter(|payload| !payload.is_empty())
+        {
+            inline
+        } else {
+            let direct_path = notification
+                .direct_path
+                .as_deref()
+                .filter(|path| path.starts_with('/'))
+                .ok_or_else(|| anyhow!("History sync notification has no valid direct path"))?;
+            let media_key = notification.media_key.as_deref().unwrap_or_default();
+            let encrypted_hash = notification.file_enc_sha256.as_deref().unwrap_or_default();
+            let plaintext_hash = notification.file_sha256.as_deref().unwrap_or_default();
+            let hash = base64::engine::general_purpose::URL_SAFE.encode(encrypted_hash);
+            let media_conn = self.request_media_conn().await?;
+            let mut last_error = None;
+            let mut downloaded = None;
+
+            for host in media_conn.hosts {
+                let separator = if direct_path.contains('?') { '&' } else { '?' };
+                let url = format!(
+                    "https://{}{}{}hash={}&mms-type=md-msg-hist&__wa-mms=",
+                    host.hostname, direct_path, separator, hash
+                );
+                match download_and_decrypt_media(
+                    &url,
+                    media_key,
+                    encrypted_hash,
+                    plaintext_hash,
+                    MediaType::History,
+                )
+                .await
+                {
+                    Ok(payload) => {
+                        downloaded = Some(payload);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
                 }
             }
+
+            downloaded.ok_or_else(|| {
+                last_error.unwrap_or_else(|| anyhow!("No media host available for history sync"))
+            })?
+        };
+
+        let raw = Self::try_decompress(&compressed)
+            .ok_or_else(|| anyhow!("History sync zlib decompression failed"))?;
+        let history = HistorySync::decode(&raw[..])
+            .context("History sync protobuf decoding failed")?;
+        let progress = history.progress;
+        let (chats, messages) = Self::map_history_sync(history);
+
+        {
+            let mut store = self.store.lock().await;
+            for chat in &chats {
+                store.add_chat(chat.clone());
+            }
         }
-        count
+
+        let event_tx = self.inner.lock().await.event_tx.clone();
+        tracing::info!(
+            "History sync decoded: {} chats, {} messages",
+            chats.len(),
+            messages.len()
+        );
+        let _ = event_tx.send(WhatsAppEvent::HistorySyncBatch {
+            chats,
+            messages,
+            progress,
+        });
+        Ok(())
+    }
+
+    fn map_history_sync(
+        history: crate::proto::wa_web_protobufs_history_sync::HistorySync,
+    ) -> (Vec<Chat>, Vec<Message>) {
+        let mut chats = Vec::new();
+        let mut messages = Vec::new();
+
+        for conversation in history.conversations {
+            let chat_id = conversation.id.clone();
+            if chat_id.is_empty() {
+                continue;
+            }
+            let last_message_timestamp = conversation
+                .last_msg_timestamp
+                .or(conversation.conversation_timestamp)
+                .unwrap_or_default() as i64;
+            chats.push(Chat {
+                id: ChatId(chat_id.clone()),
+                name: conversation.name.or(conversation.display_name),
+                unread_count: conversation.unread_count.unwrap_or_default(),
+                is_group: chat_id.ends_with("@g.us"),
+                last_message_timestamp,
+            });
+
+            for history_message in conversation.messages {
+                let Some(web_message) = history_message.message else {
+                    continue;
+                };
+                let key = web_message.key;
+                let Some(message_id) = key.id.filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                let remote_jid = key.remote_jid.unwrap_or_else(|| chat_id.clone());
+                let is_from_me = key.from_me.unwrap_or(false);
+                let sender_id = if is_from_me {
+                    "me".to_string()
+                } else {
+                    key.participant
+                        .or(web_message.participant)
+                        .unwrap_or_else(|| remote_jid.clone())
+                };
+                let text = web_message.message.and_then(|message| {
+                    message.conversation.or_else(|| {
+                        message.extended_text_message.and_then(|extended| extended.text)
+                    })
+                });
+
+                messages.push(Message {
+                    id: MessageId(message_id),
+                    chat_id: ChatId(remote_jid),
+                    sender_id,
+                    text,
+                    media: None,
+                    timestamp: web_message.message_timestamp.unwrap_or_default() as i64,
+                    is_from_me,
+                    is_forwarded: false,
+                    reply_to_id: None,
+                });
+            }
+        }
+
+        (chats, messages)
     }
 
     /// Try to decompress a zlib blob. Returns None if it's not zlib or decompression fails.
@@ -2328,6 +2453,14 @@ impl WhatsAppClient {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::WhatsAppClient;
+    use crate::client::WhatsAppEvent;
+    use crate::proto::wa_common::MessageKey;
+    use crate::proto::wa_web_protobufs_e2e::{HistorySyncNotification, Message as E2eMessage};
+    use crate::proto::wa_web_protobufs_history_sync::{Conversation, HistorySync, HistorySyncMsg};
+    use crate::proto::wa_web_protobufs_web::WebMessageInfo;
+    use flate2::{Compression, write::ZlibEncoder};
+    use prost::Message as _;
+    use std::io::Write as _;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -2388,5 +2521,70 @@ mod lifecycle_tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[tokio::test]
+    async fn inline_history_sync_decodes_real_chats_and_messages() {
+        let db_path = std::env::temp_dir().join(format!(
+            "whatsapp-mcp-history-sync-{}.db",
+            std::process::id()
+        ));
+        let db_path = db_path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&db_path);
+
+        let web_message = WebMessageInfo {
+            key: MessageKey {
+                remote_jid: Some("100@s.whatsapp.net".into()),
+                from_me: Some(false),
+                id: Some("history-message-1".into()),
+                participant: None,
+            },
+            message: Some(E2eMessage {
+                conversation: Some("history text".into()),
+                ..Default::default()
+            }),
+            message_timestamp: Some(1_725_000_000),
+            ..Default::default()
+        };
+        let history = HistorySync {
+            sync_type: 0,
+            conversations: vec![Conversation {
+                id: "100@s.whatsapp.net".into(),
+                messages: vec![HistorySyncMsg {
+                    message: Some(web_message),
+                    msg_order_id: Some(1),
+                }],
+                last_msg_timestamp: Some(1_725_000_000),
+                unread_count: Some(1),
+                name: Some("History test".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&history.encode_to_vec()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let client = WhatsAppClient::with_db_path(&db_path);
+        client
+            .process_history_sync_notification(HistorySyncNotification {
+                initial_hist_bootstrap_inline_payload: Some(compressed),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        match client.next_event().await {
+            Some(WhatsAppEvent::HistorySyncBatch { chats, messages, .. }) => {
+                assert_eq!(chats.len(), 1);
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].text.as_deref(), Some("history text"));
+                assert_eq!(messages[0].chat_id.0, "100@s.whatsapp.net");
+            }
+            other => panic!("unexpected history-sync event: {other:?}"),
+        }
+        assert_eq!(client.store.lock().await.chats.len(), 1);
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

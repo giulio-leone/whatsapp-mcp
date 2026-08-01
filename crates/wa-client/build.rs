@@ -10,6 +10,7 @@ fn main() -> Result<()> {
             "proto/waWa6/WAWebProtobufsWa6.proto",
             "proto/waAICommonDeprecated/WAAICommonDeprecated.proto",
             "proto/waCert/WACert.proto",
+            "proto/waHistorySync/WAWebProtobufsHistorySync.proto",
             "proto/signal.proto",
         ],
         &["proto/"],

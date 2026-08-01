@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use wa_client::client::{WhatsAppClient, WhatsAppEvent};
 use wa_domain::ports::WhatsAppClientPort;
+use wa_mcp_server::event_store::persist_whatsapp_event;
 use wa_mcp_server::server::McpServer;
 
 #[tokio::main]
@@ -26,6 +27,7 @@ async fn main() -> Result<()> {
     // Auto-connect and complete the post-pair login reconnect in background.
     // McpServer serves both the stateless 2026-07-28 and legacy initialize eras.
     let wa_clone = wa.clone();
+    let storage_clone = storage.clone();
     tokio::spawn(async move {
         if let Err(e) = wa_clone.connect().await {
             tracing::warn!("Auto-connect failed: {}", e);
@@ -34,6 +36,9 @@ async fn main() -> Result<()> {
 
         let mut reconnect_after_pairing = false;
         while let Some(event) = wa_clone.next_event().await {
+            if let Err(error) = persist_whatsapp_event(storage_clone.as_ref(), &event).await {
+                tracing::warn!("Failed to persist WhatsApp event: {}", error);
+            }
             match event {
                 WhatsAppEvent::PairSuccess { .. } => {
                     reconnect_after_pairing = true;

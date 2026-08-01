@@ -22,3 +22,4 @@ pub mod server;
 pub mod cli_common;
 pub mod poll_config;
 pub mod poll_engine;
+pub mod event_store;

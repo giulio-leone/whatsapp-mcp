@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use aes::cipher::{BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
 use hkdf::Hkdf;
 use rand::RngCore;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Media types recognized by WhatsApp, each with its own HKDF info string
@@ -15,6 +16,7 @@ pub enum MediaType {
     Video,
     Audio,
     Document,
+    History,
 }
 
 impl MediaType {
@@ -25,6 +27,7 @@ impl MediaType {
             MediaType::Video => b"WhatsApp Video Keys",
             MediaType::Audio => b"WhatsApp Audio Keys",
             MediaType::Document => b"WhatsApp Document Keys",
+            MediaType::History => b"WhatsApp History Keys",
         }
     }
 
@@ -35,6 +38,7 @@ impl MediaType {
             MediaType::Video => "video",
             MediaType::Audio => "audio",
             MediaType::Document => "document",
+            MediaType::History => "md-msg-hist",
         }
     }
 
@@ -45,8 +49,83 @@ impl MediaType {
             MediaType::Video => "video",
             MediaType::Audio => "audio",
             MediaType::Document => "document",
+            MediaType::History => "md-msg-hist",
         }
     }
+}
+
+/// Download and decrypt a WhatsApp media payload, validating both encrypted
+/// and plaintext SHA-256 digests before returning any data.
+pub async fn download_and_decrypt_media(
+    url: &str,
+    media_key: &[u8],
+    file_enc_sha256: &[u8],
+    file_sha256: &[u8],
+    media_type: MediaType,
+) -> Result<Vec<u8>> {
+    if media_key.len() != 32 || file_enc_sha256.len() != 32 || file_sha256.len() != 32 {
+        return Err(anyhow!("Invalid WhatsApp media key or digest length"));
+    }
+
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("Origin", "https://web.whatsapp.com")
+        .header("Referer", "https://web.whatsapp.com/")
+        .send()
+        .await
+        .context("Media download HTTP request failed")?
+        .error_for_status()
+        .context("Media download returned an error status")?;
+    let encrypted = response.bytes().await.context("Reading media download failed")?;
+
+    decrypt_media_payload(
+        &encrypted,
+        media_key,
+        file_enc_sha256,
+        file_sha256,
+        media_type,
+    )
+}
+
+fn decrypt_media_payload(
+    encrypted: &[u8],
+    media_key: &[u8],
+    file_enc_sha256: &[u8],
+    file_sha256: &[u8],
+    media_type: MediaType,
+) -> Result<Vec<u8>> {
+    if Sha256::digest(encrypted).as_slice() != file_enc_sha256 {
+        return Err(anyhow!("Encrypted media SHA-256 mismatch"));
+    }
+    if encrypted.len() <= 10 {
+        return Err(anyhow!("Encrypted media payload is too short"));
+    }
+
+    let (iv, aes_key, hmac_key) = derive_media_keys(media_key, media_type)?;
+    let split = encrypted.len() - 10;
+    let (ciphertext, supplied_mac) = encrypted.split_at(split);
+    let mut mac = HmacSha256::new_from_slice(&hmac_key)
+        .map_err(|_| anyhow!("HMAC key error"))?;
+    mac.update(&iv);
+    mac.update(ciphertext);
+    let expected_mac = mac.finalize().into_bytes();
+    if expected_mac[..10] != supplied_mac[..] {
+        return Err(anyhow!("Encrypted media HMAC mismatch"));
+    }
+
+    let iv_arr: [u8; 16] = iv.try_into().map_err(|_| anyhow!("IV size mismatch"))?;
+    let key_arr: [u8; 32] = aes_key.try_into().map_err(|_| anyhow!("AES key size mismatch"))?;
+    let decryptor = Aes256CbcDec::new(&key_arr.into(), &iv_arr.into());
+    let mut plaintext = ciphertext.to_vec();
+    let plaintext = decryptor
+        .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut plaintext)
+        .map_err(|_| anyhow!("AES-CBC media decryption failed"))?
+        .to_vec();
+
+    if Sha256::digest(&plaintext).as_slice() != file_sha256 {
+        return Err(anyhow!("Decrypted media SHA-256 mismatch"));
+    }
+    Ok(plaintext)
 }
 
 /// Result of encrypting a media file for upload
@@ -268,11 +347,30 @@ mod tests {
         assert_eq!(MediaType::Video.hkdf_info(), b"WhatsApp Video Keys");
         assert_eq!(MediaType::Audio.hkdf_info(), b"WhatsApp Audio Keys");
         assert_eq!(MediaType::Document.hkdf_info(), b"WhatsApp Document Keys");
+        assert_eq!(MediaType::History.hkdf_info(), b"WhatsApp History Keys");
     }
 
     #[test]
     fn test_invalid_key_length() {
         let result = encrypt_media_with_key(b"test", &[0u8; 16], MediaType::Image);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn history_media_roundtrip_validates_and_decrypts() {
+        let plaintext = b"compressed history sync payload";
+        let key = [7u8; 32];
+        let encrypted = encrypt_media_with_key(plaintext, &key, MediaType::History).unwrap();
+
+        let decrypted = decrypt_media_payload(
+            &encrypted.ciphertext,
+            &encrypted.media_key,
+            &encrypted.file_enc_sha256,
+            &encrypted.file_sha256,
+            MediaType::History,
+        )
+        .unwrap();
+
+        assert_eq!(decrypted, plaintext);
     }
 }

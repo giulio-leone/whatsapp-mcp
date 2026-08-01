@@ -6,6 +6,8 @@
 use wa_client::client::{WhatsAppClient, WhatsAppEvent};
 use wa_client::qr::QrRef;
 use wa_domain::ports::WhatsAppClientPort;
+use wa_mcp_server::event_store::persist_whatsapp_event;
+use wa_storage_sqlite::SqliteStorage;
 use std::time::Duration;
 
 #[tokio::main]
@@ -47,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("   Explicit replacement requested; removing existing database...");
         std::fs::remove_file(&db_path)?;
     }
+    let storage = SqliteStorage::new(&db_path)?;
 
     // Phase 1: QR pairing
     let paired_jid = loop {
@@ -186,6 +189,44 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if login_success {
+            eprintln!("   Waiting for initial WhatsApp history sync...");
+            let sync_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut synced_chats = 0usize;
+            let mut synced_messages = 0usize;
+
+            loop {
+                let now = tokio::time::Instant::now();
+                let next_deadline = std::cmp::min(sync_deadline, idle_deadline);
+                if now >= next_deadline {
+                    break;
+                }
+                match tokio::time::timeout(next_deadline - now, client.next_event()).await {
+                    Ok(Some(event)) => {
+                        if let Err(error) = persist_whatsapp_event(&storage, &event).await {
+                            eprintln!("⚠️  Failed to persist WhatsApp sync event: {}", error);
+                        }
+                        match event {
+                            WhatsAppEvent::HistorySyncBatch { chats, messages, progress } => {
+                                synced_chats += chats.len();
+                                synced_messages += messages.len();
+                                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                                if progress.is_some_and(|value| value >= 100) {
+                                    break;
+                                }
+                            }
+                            WhatsAppEvent::Disconnected => break,
+                            _ => {}
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            eprintln!(
+                "   History sync persisted: {} chats, {} messages",
+                synced_chats, synced_messages
+            );
+
             eprintln!();
             eprintln!("🎉 WhatsApp connection fully established!");
             eprintln!("   JID: {}", paired_jid);
@@ -193,8 +234,6 @@ async fn main() -> anyhow::Result<()> {
             eprintln!();
             eprintln!("   You can now use the MCP server!");
 
-            // Keep connection alive briefly to let server sync
-            tokio::time::sleep(Duration::from_secs(5)).await;
             let _ = client.disconnect().await;
             break;
         }
