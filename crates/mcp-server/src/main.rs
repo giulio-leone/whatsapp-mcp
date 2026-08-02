@@ -1,9 +1,16 @@
 use anyhow::Result;
 use std::sync::Arc;
 use wa_client::client::{WhatsAppClient, WhatsAppEvent};
-use wa_domain::ports::WhatsAppClientPort;
+use wa_domain::ports::{StoragePort, WhatsAppClientPort};
 use wa_mcp_server::event_store::persist_whatsapp_event;
 use wa_mcp_server::server::McpServer;
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,6 +40,21 @@ async fn main() -> Result<()> {
             tracing::warn!("Auto-connect failed: {}", e);
             return;
         }
+
+        let heartbeat_client = wa_clone.clone();
+        let heartbeat_storage = storage_clone.clone();
+        tokio::spawn(async move {
+            loop {
+                let connected = heartbeat_client.is_connected().await.unwrap_or(false);
+                if let Err(error) = heartbeat_storage
+                    .set_runtime_connection(connected, unix_time_ms())
+                    .await
+                {
+                    tracing::warn!("Failed to publish WhatsApp runtime state: {}", error);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
 
         let mut reconnect_after_pairing = false;
         while let Some(event) = wa_clone.next_event().await {

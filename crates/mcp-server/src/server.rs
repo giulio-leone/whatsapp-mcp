@@ -18,6 +18,7 @@ use wa_domain::ports::{PairingPhase, PairingSnapshot, StoragePort, WhatsAppClien
 
 const PAIRING_WIDGET_HTML: &str = include_str!("../../../apps/whatsapp-pairing.html");
 const QR_TTL_MS: u64 = 120_000;
+const RUNTIME_HEARTBEAT_TTL_MS: u64 = 10_000;
 
 pub struct McpServer {
     storage: Arc<dyn StoragePort>,
@@ -301,10 +302,16 @@ impl McpServer {
     async fn tool_list_chats(
         &self,
         req: &JsonRpcRequest,
-        _args: &serde_json::Value,
+        args: &serde_json::Value,
     ) -> JsonRpcResponse {
-        match self.wa_client.list_chats().await {
-            Ok(chats) => {
+        let limit = args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(20)
+            .min(50) as usize;
+        match self.storage.list_chats().await {
+            Ok(mut chats) => {
+                chats.truncate(limit);
                 let result = ToolResult {
                     content: vec![ToolResultContent {
                         content_type: "text".into(),
@@ -509,7 +516,7 @@ impl McpServer {
 
     async fn tool_connection_status(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
         // Read authoritative client state — never infer connectivity from cached chats.
-        let (status, is_error) = match self.wa_client.is_connected().await {
+        let (status, is_error) = match self.shared_connection_is_connected().await {
             Ok(true) => (
                 connection_status_payload(true),
                 None,
@@ -542,7 +549,12 @@ impl McpServer {
 
     async fn tool_pairing_status(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
         match self.wa_client.pairing_snapshot().await {
-            Ok(snapshot) => pairing_response(req, &snapshot),
+            Ok(mut snapshot) => {
+                if self.shared_connection_is_connected().await.unwrap_or(false) {
+                    snapshot.phase = PairingPhase::Connected;
+                }
+                pairing_response(req, &snapshot)
+            }
             Err(error) => self.tool_error(
                 req,
                 &format!("Could not inspect WhatsApp pairing state: {error}"),
@@ -551,12 +563,25 @@ impl McpServer {
     }
 
     async fn tool_restart_pairing(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
+        if self.shared_connection_is_connected().await.unwrap_or(false) {
+            return self.tool_pairing_status(req).await;
+        }
         if let Err(error) = self.wa_client.restart_pairing().await {
             let snapshot = self.wa_client.pairing_snapshot().await.ok();
             return pairing_retry_failure_response(req, snapshot.as_ref(), &error.to_string());
         }
 
         self.tool_pairing_status(req).await
+    }
+
+    async fn shared_connection_is_connected(&self) -> Result<bool> {
+        if self.wa_client.is_connected().await? {
+            return Ok(true);
+        }
+        let Some((connected, updated_at_ms)) = self.storage.get_runtime_connection().await? else {
+            return Ok(false);
+        };
+        Ok(connected && unix_time_ms().saturating_sub(updated_at_ms) <= RUNTIME_HEARTBEAT_TTL_MS)
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────

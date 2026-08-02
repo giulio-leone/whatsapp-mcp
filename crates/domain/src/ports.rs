@@ -68,6 +68,17 @@ pub trait StoragePort: Send + Sync {
     
     async fn save_chat(&self, chat: &Chat) -> Result<()>;
     async fn get_chat(&self, chat_id: &ChatId) -> Result<Option<Chat>>;
+    async fn list_chats(&self) -> Result<Vec<Chat>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_runtime_connection(&self, _connected: bool, _updated_at_ms: u64) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_runtime_connection(&self) -> Result<Option<(bool, u64)>> {
+        Ok(None)
+    }
     
     async fn save_contact(&self, contact: &Contact) -> Result<()>;
     async fn search_contacts(&self, query: &str) -> Result<Vec<Contact>>;

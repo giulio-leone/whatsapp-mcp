@@ -49,6 +49,12 @@ impl SqliteStorage {
                  formatted_number TEXT NOT NULL,
                  is_business INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                 key TEXT PRIMARY KEY,
+                 connected INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+            );
             ",
         )?;
         Ok(())
@@ -175,6 +181,55 @@ impl StoragePort for SqliteStorage {
         }
     }
 
+    async fn list_chats(&self) -> Result<Vec<Chat>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, unread_count, is_group, last_message_timestamp
+             FROM chats
+             ORDER BY last_message_timestamp DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Chat {
+                    id: ChatId(row.get(0)?),
+                    name: row.get(1)?,
+                    unread_count: row.get(2)?,
+                    is_group: row.get::<_, i32>(3)? != 0,
+                    last_message_timestamp: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    async fn set_runtime_connection(&self, connected: bool, updated_at_ms: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runtime_state (key, connected, updated_at_ms)
+             VALUES ('whatsapp_connection', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                 connected = excluded.connected,
+                 updated_at_ms = excluded.updated_at_ms",
+            rusqlite::params![connected as i32, updated_at_ms],
+        )?;
+        Ok(())
+    }
+
+    async fn get_runtime_connection(&self) -> Result<Option<(bool, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT connected, updated_at_ms FROM runtime_state WHERE key = 'whatsapp_connection'",
+        )?;
+        let mut rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i32>(0)? != 0, row.get::<_, u64>(1)?))
+        })?;
+        match rows.next() {
+            Some(Ok(state)) => Ok(Some(state)),
+            Some(Err(error)) => Err(error.into()),
+            None => Ok(None),
+        }
+    }
+
     async fn save_contact(&self, contact: &Contact) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -210,5 +265,41 @@ impl StoragePort for SqliteStorage {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteStorage;
+    use wa_domain::models::chat::{Chat, ChatId};
+    use wa_domain::ports::StoragePort;
+
+    #[tokio::test]
+    async fn shares_runtime_connection_and_persisted_chats() {
+        let storage = SqliteStorage::new(":memory:").expect("in-memory storage");
+        storage
+            .save_chat(&Chat {
+                id: ChatId("recent-chat".into()),
+                name: None,
+                unread_count: 0,
+                is_group: false,
+                last_message_timestamp: 42,
+            })
+            .await
+            .expect("save chat");
+        storage
+            .set_runtime_connection(true, 1234)
+            .await
+            .expect("save runtime state");
+
+        let chats = storage.list_chats().await.expect("list chats");
+        let runtime = storage
+            .get_runtime_connection()
+            .await
+            .expect("read runtime state");
+
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].id.0, "recent-chat");
+        assert_eq!(runtime, Some((true, 1234)));
     }
 }

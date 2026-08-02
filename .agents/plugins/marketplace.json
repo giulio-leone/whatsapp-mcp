@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "whatsapp-mcp",
-      "version": "0.1.0+codex.local-20260801-150602",
+      "version": "0.1.0+codex.local-20260802-231143",
       "source": {
         "source": "local",
         "path": "."
