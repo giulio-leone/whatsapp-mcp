@@ -17,6 +17,7 @@
 
 pub mod bridge;
 pub mod protocol;
+pub mod runtime;
 pub mod tools;
 pub mod server;
 pub mod cli_common;

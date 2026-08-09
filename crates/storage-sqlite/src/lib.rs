@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::sync::Mutex;
 use wa_domain::models::chat::{Chat, ChatId};
 use wa_domain::models::contact::Contact;
@@ -140,6 +140,56 @@ impl StoragePort for SqliteStorage {
         Ok(rows)
     }
 
+    async fn get_message(&self, chat_id: &ChatId, message_id: &MessageId) -> Result<Option<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, sender_id, text, timestamp, is_from_me, is_forwarded, reply_to_id
+             FROM messages WHERE chat_id = ?1 AND id = ?2",
+        )?;
+        let message = stmt
+            .query_row(rusqlite::params![chat_id.0, message_id.0], |row| {
+                Ok(Message {
+                    id: MessageId(row.get(0)?),
+                    chat_id: ChatId(row.get(1)?),
+                    sender_id: row.get(2)?,
+                    text: row.get(3)?,
+                    media: None,
+                    timestamp: row.get(4)?,
+                    is_from_me: row.get::<_, i32>(5)? != 0,
+                    is_forwarded: row.get::<_, i32>(6)? != 0,
+                    reply_to_id: row.get::<_, Option<String>>(7)?.map(MessageId),
+                })
+            })
+            .optional()?;
+        Ok(message)
+    }
+
+    async fn update_message_text(
+        &self,
+        chat_id: &ChatId,
+        message_id: &MessageId,
+        text: &str,
+        timestamp: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE messages SET text = ?3, timestamp = ?4
+             WHERE chat_id = ?1 AND id = ?2 AND is_from_me = 1",
+            rusqlite::params![chat_id.0, message_id.0, text, timestamp],
+        )?;
+        Ok(updated == 1)
+    }
+
+    async fn delete_message(&self, chat_id: &ChatId, message_id: &MessageId) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM messages
+             WHERE chat_id = ?1 AND id = ?2 AND is_from_me = 1",
+            rusqlite::params![chat_id.0, message_id.0],
+        )?;
+        Ok(deleted == 1)
+    }
+
     async fn save_chat(&self, chat: &Chat) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -272,6 +322,7 @@ impl StoragePort for SqliteStorage {
 mod tests {
     use super::SqliteStorage;
     use wa_domain::models::chat::{Chat, ChatId};
+    use wa_domain::models::message::{Message, MessageId};
     use wa_domain::ports::StoragePort;
 
     #[tokio::test]
@@ -301,5 +352,76 @@ mod tests {
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].id.0, "recent-chat");
         assert_eq!(runtime, Some((true, 1234)));
+    }
+
+    #[tokio::test]
+    async fn updates_and_deletes_only_owned_message_in_exact_chat() {
+        let storage = SqliteStorage::new(":memory:").expect("in-memory storage");
+        let owned = Message {
+            id: MessageId("owned-message".into()),
+            chat_id: ChatId("target-chat".into()),
+            sender_id: "me".into(),
+            text: Some("before".into()),
+            media: None,
+            timestamp: 42,
+            is_from_me: true,
+            is_forwarded: false,
+            reply_to_id: None,
+        };
+        let incoming = Message {
+            id: MessageId("incoming-message".into()),
+            chat_id: ChatId("target-chat".into()),
+            sender_id: "someone".into(),
+            text: Some("incoming".into()),
+            is_from_me: false,
+            ..owned.clone()
+        };
+        storage.save_message(&owned).await.expect("save owned message");
+        storage
+            .save_message(&incoming)
+            .await
+            .expect("save incoming message");
+
+        assert!(!storage
+            .update_message_text(
+                &ChatId("wrong-chat".into()),
+                &owned.id,
+                "must-not-change",
+                99,
+            )
+            .await
+            .expect("wrong-chat update"));
+        assert!(!storage
+            .update_message_text(&incoming.chat_id, &incoming.id, "must-not-change", 99)
+            .await
+            .expect("incoming update"));
+        assert!(storage
+            .update_message_text(&owned.chat_id, &owned.id, "after", 99)
+            .await
+            .expect("owned update"));
+        assert_eq!(
+            storage
+                .get_message(&owned.chat_id, &owned.id)
+                .await
+                .expect("read owned")
+                .expect("owned exists")
+                .text
+                .as_deref(),
+            Some("after")
+        );
+
+        assert!(!storage
+            .delete_message(&incoming.chat_id, &incoming.id)
+            .await
+            .expect("incoming delete"));
+        assert!(storage
+            .delete_message(&owned.chat_id, &owned.id)
+            .await
+            .expect("owned delete"));
+        assert!(storage
+            .get_message(&owned.chat_id, &owned.id)
+            .await
+            .expect("read deleted")
+            .is_none());
     }
 }

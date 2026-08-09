@@ -15,7 +15,7 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
            │
 ┌──────────▼───────────┐
 │   wa-mcp-server      │  ← MCP protocol handler
-│   (Rust, crates/     │     9 intent-based tools + pairing app
+│   (Rust, crates/     │     11 intent-based tools + pairing app
 │    mcp-server)       │
 └────┬────────────┬────┘
      │            │
@@ -45,7 +45,7 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
 | `wa-domain` | Shared models (`Chat`, `Message`, `Contact`, `Jid`) and port traits |
 | `wa-client` | WhatsApp Web Multi-Device protocol: Noise handshake, Signal encryption, binary codec |
 | `storage-sqlite` | SQLite persistence for messages, chats, contacts |
-| `mcp-server` | JSON-RPC 2.0 MCP server with 9 tools and a private pairing app |
+| `mcp-server` | JSON-RPC 2.0 MCP server with 11 tools and a private pairing app |
 
 ## MCP Tools
 
@@ -56,10 +56,12 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
 | `search_contacts` | 🟢 read-only | Search contacts by name/number |
 | `get_chat_info` | 🟢 read-only | Get detailed info for a single chat |
 | `send_message` | 🟡 write | Send a text message (requires confirmation) |
+| `edit_message` | 🟡 write | Edit a text message sent by this account (requires confirmation) |
+| `delete_message` | 🔴 destructive | Delete a message sent by this account for all participants (requires confirmation) |
 | `get_connection_status` | 🟢 read-only | Check WhatsApp session health |
 | `open_pairing` | 🟢 read-only | Open the private pairing app in Codex |
 | `get_pairing_status` | 🟢 app-only | Poll pairing state without exposing the QR to the model |
-| `restart_pairing` | 🟡 app-only | Retry first-time pairing without a saved session; retry reconnection for a disconnected saved session without replacing the database or session |
+| `restart_pairing` | 🟡 app-only | Retry pairing; archive a server-rejected registration and generate a fresh QR without deleting chat history |
 
 ## Quick Start
 
@@ -73,7 +75,7 @@ cargo build --release
 
 ### Run
 ```bash
-# The server communicates over stdio (JSON-RPC)
+# Each MCP client communicates over stdio; one local runtime owns WhatsApp
 ./target/release/wa-mcp-server
 ```
 
@@ -91,6 +93,11 @@ The stdio server supports both MCP wire eras:
 
 The modern and legacy paths share the same tool registry; the server does not
 enable HTTP transport.
+
+Every stdio process connects to one Unix-domain runtime socket derived from
+`WA_DB_PATH`. The first process owns the WhatsApp connection and SQLite-backed
+session; later Codex tasks proxy requests to that owner. This prevents session
+lock contention and keeps connection state consistent across task processes.
 
 ### Install as a Codex plugin
 
@@ -142,12 +149,12 @@ The MCP server exposes the component as an MCP Apps resource
 result `_meta`, rendered inside the private app, and never placed in
 model-visible `structuredContent` or `content`. No QR file is written to disk.
 
-The integrated flow supports safe first-time setup and non-destructive recovery.
-When no saved session exists, `restart_pairing` retries first-time pairing. When
-a saved session exists but is disconnected, the same action retries reconnection
-while preserving the database and session. Destructive session replacement
-remains unavailable through MCP and still requires the explicit
-`--replace-existing-session` flag in the legacy terminal utility.
+The integrated flow supports safe first-time setup and recovery. When no saved
+session exists, `restart_pairing` retries first-time pairing. When WhatsApp
+rejects a saved registration with 401, the runtime archives only its encrypted
+`device_store` state under a timestamped key, activates fresh device keys
+atomically, and generates a new QR. Chats, contacts, and message history remain
+in the same database. The entire database is never replaced through MCP.
 
 The legacy terminal utility remains available for recovery. It requires the
 explicit `--replace-existing-session` flag before deleting an existing database:

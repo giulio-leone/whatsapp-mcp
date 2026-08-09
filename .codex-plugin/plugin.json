@@ -19,8 +19,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "WhatsApp MCP",
-    "shortDescription": "Read WhatsApp chats and send approved messages",
-    "longDescription": "Connect Codex to WhatsApp through a native Rust MCP server with local SQLite session storage, private in-Codex QR pairing, read-only chat tools, and explicit write safety metadata.",
+    "shortDescription": "Manage explicitly approved WhatsApp messages",
+    "longDescription": "Connect Codex to one shared WhatsApp runtime using MCP 2026-07-28, durable SQLite session storage, private in-Codex QR recovery, message CRUD, and explicit write safety metadata.",
     "developerName": "Giulio Leone",
     "category": "Developer Tools",
     "capabilities": [

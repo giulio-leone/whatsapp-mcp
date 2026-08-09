@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::{Mutex, oneshot};
 
 use wa_domain::ports::{PairingPhase, PairingSnapshot, WhatsAppClientPort};
@@ -25,9 +26,84 @@ use crate::crypto::session::Session;
 const WA_WEB_VERSION: (u32, u32, u32) = (2, 3000, 1043636855);
 const WA_WEB_VERSION_STRING: &str = "2.3000.1043636855";
 const CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(25);
+const PAIRING_RECONNECT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCONNECT_NONE: u8 = 0;
+const DISCONNECT_AUTHENTICATION: u8 = 1;
+const DISCONNECT_TRANSPORT: u8 = 2;
 
 fn wa_web_build_hash() -> Vec<u8> {
     md5::compute(WA_WEB_VERSION_STRING).0.to_vec()
+}
+
+fn generate_message_id(our_jid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(chrono::Utc::now().timestamp().to_be_bytes());
+    hasher.update(our_jid.as_bytes());
+    hasher.update(rand::random::<[u8; 16]>());
+    let hash = hasher.finalize();
+    format!("3EB0{}", hex::encode(&hash[..9]).to_uppercase())
+}
+
+fn encrypted_recipient_node(device_jid: &str, kind: &str, envelope: Vec<u8>) -> Node {
+    let encrypted = Node::new(
+        "enc",
+        [
+            ("v".into(), AttrValue::String("2".into())),
+            ("type".into(), AttrValue::String(kind.into())),
+        ].into_iter().collect(),
+        Content::Bytes(envelope),
+    );
+    Node::new(
+        "to",
+        [("jid".into(), AttrValue::String(device_jid.into()))].into_iter().collect(),
+        Content::Nodes(vec![encrypted]),
+    )
+}
+
+fn edit_protocol_message(
+    chat_id: &ChatId,
+    message_id: &str,
+    text: &str,
+    timestamp_ms: i64,
+) -> crate::proto::wa_web_protobufs_e2e::ProtocolMessage {
+    use crate::proto::wa_common::MessageKey;
+    use crate::proto::wa_web_protobufs_e2e as e2e;
+    e2e::ProtocolMessage {
+        key: Some(MessageKey {
+            remote_jid: Some(chat_id.0.clone()),
+            from_me: Some(true),
+            id: Some(message_id.into()),
+            participant: None,
+        }),
+        r#type: Some(e2e::protocol_message::Type::MessageEdit.into()),
+        edited_message: Some(Box::new(e2e::Message {
+            conversation: Some(text.into()),
+            ..Default::default()
+        })),
+        timestamp_ms: Some(timestamp_ms),
+        ..Default::default()
+    }
+}
+
+fn delete_protocol_message(
+    chat_id: &ChatId,
+    message_id: &str,
+    timestamp_ms: i64,
+) -> crate::proto::wa_web_protobufs_e2e::ProtocolMessage {
+    use crate::proto::wa_common::MessageKey;
+    use crate::proto::wa_web_protobufs_e2e as e2e;
+    e2e::ProtocolMessage {
+        key: Some(MessageKey {
+            remote_jid: Some(chat_id.0.clone()),
+            from_me: Some(true),
+            id: Some(message_id.into()),
+            participant: None,
+        }),
+        r#type: Some(e2e::protocol_message::Type::Revoke.into()),
+        timestamp_ms: Some(timestamp_ms),
+        ..Default::default()
+    }
 }
 
 #[cfg(unix)]
@@ -122,6 +198,7 @@ pub struct WhatsAppClient {
     lifecycle_lock: Arc<Mutex<()>>,
     read_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     session_lock: Arc<Mutex<Option<SessionLock>>>,
+    disconnect_reason: Arc<AtomicU8>,
     db_path: String,
     stealth: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -174,6 +251,7 @@ impl WhatsAppClient {
             lifecycle_lock: Arc::new(Mutex::new(())),
             read_task: Arc::new(Mutex::new(None)),
             session_lock: Arc::new(Mutex::new(None)),
+            disconnect_reason: Arc::new(AtomicU8::new(DISCONNECT_NONE)),
             db_path: db_path.to_string(),
             stealth: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -209,6 +287,138 @@ impl WhatsAppClient {
         Ok(())
     }
 
+    async fn archive_invalid_session_and_reset(&self) -> Result<()> {
+        let mut store = self.store.lock().await;
+        let replacement = DeviceStore::new();
+        let mut conn = rusqlite::Connection::open(&self.db_path)?;
+        let archive_key = store.archive_and_replace_in_db(&mut conn, &replacement)?;
+        *store = replacement;
+        tracing::warn!("Archived rejected WhatsApp registration as {} and prepared fresh pairing", archive_key);
+        Ok(())
+    }
+
+    fn stream_error_is_authentication_failure(node: &Node) -> bool {
+        if node.get_attr("code") == Some("401") {
+            return true;
+        }
+        match &node.content {
+            Content::Nodes(children) => children.iter().any(|child| {
+                child.get_attr("code") == Some("401")
+                    || child.tag == "not-authorized"
+                    || child.tag == "unauthorized"
+            }),
+            _ => false,
+        }
+    }
+
+    async fn relay_protocol_message(
+        &self,
+        chat_id: &ChatId,
+        protocol_message: crate::proto::wa_web_protobufs_e2e::ProtocolMessage,
+    ) -> Result<String> {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        let jid = chat_id.0.clone();
+        let is_broadcast = jid.contains("@broadcast");
+        let user_part = jid.split('@').next().unwrap_or(&jid);
+        let our_jid = self.store.lock().await.our_jid.clone().unwrap_or_default();
+        let our_user = our_jid.split(':').next().unwrap_or("").split('@').next().unwrap_or("");
+        let our_device_id = our_jid.split(':').nth(1)
+            .and_then(|value| value.split('@').next())
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        let message = e2e::Message {
+            protocol_message: Some(Box::new(protocol_message)),
+            ..Default::default()
+        };
+        let recipient_devices = if is_broadcast {
+            Vec::new()
+        } else {
+            self.discover_devices(user_part).await
+        };
+        let own_devices = if our_user.is_empty() {
+            Vec::new()
+        } else {
+            self.discover_devices(our_user).await.into_iter()
+                .filter(|device_id| *device_id != our_device_id)
+                .collect::<Vec<_>>()
+        };
+
+        let mut encoded = Vec::new();
+        message.encode(&mut encoded)?;
+        let recipient_payload = Self::pad_message(&encoded);
+        let own_message = if is_broadcast {
+            message.clone()
+        } else {
+            e2e::Message {
+                device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
+                    destination_jid: Some(jid.clone()),
+                    message: Some(Box::new(message.clone())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+        };
+        let mut own_encoded = Vec::new();
+        own_message.encode(&mut own_encoded)?;
+        let own_payload = Self::pad_message(&own_encoded);
+
+        let mut recipients = Vec::new();
+        let mut sessions = Vec::new();
+        let mut any_prekey_message = false;
+        for device_id in recipient_devices {
+            let device_jid = format!("{}:{}@s.whatsapp.net", user_part, device_id);
+            match self.encrypt_for_device(&device_jid, &recipient_payload).await {
+                Ok((kind, envelope, session)) => {
+                    any_prekey_message |= kind == "pkmsg";
+                    recipients.push(encrypted_recipient_node(&device_jid, &kind, envelope));
+                    sessions.push((device_jid, serde_json::to_vec(&session)?));
+                }
+                Err(error) => tracing::warn!("Failed to encrypt protocol message for {}: {}", device_jid, error),
+            }
+        }
+        for device_id in own_devices {
+            let device_jid = format!("{}:{}@s.whatsapp.net", our_user, device_id);
+            match self.encrypt_for_device(&device_jid, &own_payload).await {
+                Ok((kind, envelope, session)) => {
+                    any_prekey_message |= kind == "pkmsg";
+                    recipients.push(encrypted_recipient_node(&device_jid, &kind, envelope));
+                    sessions.push((device_jid, serde_json::to_vec(&session)?));
+                }
+                Err(error) => tracing::warn!("Failed to encrypt protocol message for own device {}: {}", device_jid, error),
+            }
+        }
+        if recipients.is_empty() {
+            return Err(anyhow!("Failed to encrypt protocol message for any device"));
+        }
+
+        let message_id = generate_message_id(&our_jid);
+        let participants = Node::new("participants", HashMap::new(), Content::Nodes(recipients));
+        let mut children = vec![participants];
+        if any_prekey_message {
+            if let Some(identity) = self.store.lock().await.account_identity.clone() {
+                children.push(Node::new("device-identity", HashMap::new(), Content::Bytes(identity)));
+            }
+        }
+        let message_node = Node::new(
+            "message",
+            [
+                ("id".into(), AttrValue::String(message_id.clone())),
+                ("to".into(), AttrValue::String(jid)),
+                ("type".into(), AttrValue::String("text".into())),
+            ].into_iter().collect(),
+            Content::Nodes(children),
+        );
+        self.send_node(&message_node).await?;
+        {
+            let mut store = self.store.lock().await;
+            for (device_jid, session) in sessions {
+                store.save_session(device_jid, session);
+            }
+        }
+        self.persist_store().await?;
+        Ok(message_id)
+    }
+
     async fn stop_read_loop(&self) {
         let task = self.read_task.lock().await.take();
         if let Some(task) = task {
@@ -231,6 +441,7 @@ impl WhatsAppClient {
 
     async fn connect_inner(&self) -> Result<()> {
         self.acquire_session_lock().await?;
+        self.disconnect_reason.store(DISCONNECT_NONE, Ordering::Release);
 
         {
             let state = self.state.lock().await;
@@ -317,10 +528,36 @@ impl WhatsAppClientPort for WhatsAppClient {
 
     async fn restart_pairing(&self) -> Result<()> {
         let _lifecycle = self.lifecycle_lock.lock().await;
+        let had_saved_session = self.store.lock().await.our_jid.is_some();
         if *self.state.lock().await != ConnectionState::Disconnected {
             self.disconnect_inner().await?;
         }
         *self.latest_qr.lock().await = None;
+        self.connect_inner().await?;
+        if !had_saved_session {
+            return Ok(());
+        }
+
+        let authentication_rejected = timeout(PAIRING_RECONNECT_SETTLE_TIMEOUT, async {
+            loop {
+                if self.disconnect_reason.load(Ordering::Acquire) == DISCONNECT_AUTHENTICATION {
+                    return true;
+                }
+                if *self.state.lock().await == ConnectionState::Connected {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }).await.unwrap_or(false);
+        if !authentication_rejected {
+            return Ok(());
+        }
+
+        self.stop_read_loop().await;
+        self.inner.lock().await.sender = None;
+        self.archive_invalid_session_and_reset().await?;
+        self.disconnect_reason.store(DISCONNECT_NONE, Ordering::Release);
+        *self.state.lock().await = ConnectionState::Disconnected;
         self.connect_inner().await
     }
 
@@ -517,6 +754,33 @@ impl WhatsAppClientPort for WhatsAppClient {
             is_forwarded: false,
             reply_to_id: None,
         })
+    }
+
+    async fn edit_message(&self, chat_id: &ChatId, message_id: &str, text: &str) -> Result<Message> {
+        let timestamp = chrono::Utc::now().timestamp();
+        self.relay_protocol_message(
+            chat_id,
+            edit_protocol_message(chat_id, message_id, text, chrono::Utc::now().timestamp_millis()),
+        ).await?;
+        Ok(Message {
+            id: MessageId(message_id.into()),
+            chat_id: chat_id.clone(),
+            sender_id: "me".into(),
+            text: Some(text.into()),
+            media: None,
+            timestamp,
+            is_from_me: true,
+            is_forwarded: false,
+            reply_to_id: None,
+        })
+    }
+
+    async fn delete_message(&self, chat_id: &ChatId, message_id: &str) -> Result<()> {
+        self.relay_protocol_message(
+            chat_id,
+            delete_protocol_message(chat_id, message_id, chrono::Utc::now().timestamp_millis()),
+        ).await?;
+        Ok(())
     }
 
     async fn send_reaction(&self, chat_id: &ChatId, message_id: &str, emoji: &str) -> Result<()> {
@@ -1928,8 +2192,27 @@ impl WhatsAppClient {
                                 "failure" => {
                                     let reason = node.get_attr("reason").unwrap_or("unknown");
                                     tracing::error!("Login failed: {}", reason);
+                                    self.disconnect_reason.store(
+                                        if reason == "401" || reason.eq_ignore_ascii_case("not-authorized") {
+                                            DISCONNECT_AUTHENTICATION
+                                        } else {
+                                            DISCONNECT_TRANSPORT
+                                        },
+                                        Ordering::Release,
+                                    );
+                                    *state.lock().await = ConnectionState::Disconnected;
+                                    let _ = event_tx.send(WhatsAppEvent::Disconnected);
+                                    break;
                                 }
                                 "stream:error" => {
+                                    self.disconnect_reason.store(
+                                        if Self::stream_error_is_authentication_failure(&node) {
+                                            DISCONNECT_AUTHENTICATION
+                                        } else {
+                                            DISCONNECT_TRANSPORT
+                                        },
+                                        Ordering::Release,
+                                    );
                                     // Log all available details from the stream:error node
                                     let err_attrs: Vec<_> = node.attrs.iter()
                                         .map(|(k, v)| format!("{}={:?}", k, v))
@@ -1998,6 +2281,7 @@ impl WhatsAppClient {
                 }
                 Err(e) => {
                     tracing::error!("Read loop terminated: {}", e);
+                    self.disconnect_reason.store(DISCONNECT_TRANSPORT, Ordering::Release);
                     if *state.lock().await != ConnectionState::PairingSucceeded {
                         *state.lock().await = ConnectionState::Disconnected;
                     }
@@ -2497,7 +2781,8 @@ impl WhatsAppClient {
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use super::WhatsAppClient;
+    use super::{WhatsAppClient, delete_protocol_message, edit_protocol_message};
+    use crate::binary::node::{AttrValue, Content, Node};
     use crate::client::WhatsAppEvent;
     use crate::proto::wa_common::MessageKey;
     use crate::proto::wa_web_protobufs_e2e::{HistorySyncNotification, Message as E2eMessage};
@@ -2517,6 +2802,30 @@ mod lifecycle_tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn stream_error_401_is_classified_as_rejected_registration() {
+        let node = Node::new(
+            "stream:error",
+            [("code".into(), AttrValue::String("401".into()))].into_iter().collect(),
+            Content::None,
+        );
+        assert!(WhatsAppClient::stream_error_is_authentication_failure(&node));
+    }
+
+    #[test]
+    fn edit_and_delete_use_whatsapp_protocol_messages_for_owned_target() {
+        use crate::proto::wa_web_protobufs_e2e::protocol_message::Type;
+        let chat_id = wa_domain::models::chat::ChatId("target@s.whatsapp.net".into());
+        let edit = edit_protocol_message(&chat_id, "message-1", "replacement", 123);
+        let delete = delete_protocol_message(&chat_id, "message-1", 124);
+        assert_eq!(edit.r#type, Some(Type::MessageEdit.into()));
+        assert_eq!(edit.key.as_ref().unwrap().from_me, Some(true));
+        assert_eq!(edit.edited_message.as_ref().unwrap().conversation.as_deref(), Some("replacement"));
+        assert_eq!(delete.r#type, Some(Type::Revoke.into()));
+        assert_eq!(delete.key.as_ref().unwrap().from_me, Some(true));
+        assert!(delete.edited_message.is_none());
     }
 
     #[tokio::test]

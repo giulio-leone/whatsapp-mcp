@@ -180,6 +180,39 @@ impl DeviceStore {
         Ok(())
     }
 
+    /// Archive the current registered identity and atomically activate a fresh
+    /// unregistered store. Message/chat tables are not touched.
+    pub fn archive_and_replace_in_db(
+        &self,
+        conn: &mut rusqlite::Connection,
+        replacement: &DeviceStore,
+    ) -> anyhow::Result<String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS device_store (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );"
+        )?;
+        let archived_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let archive_key = format!("state.invalid.{archived_at}");
+        let current = serde_json::to_vec(self)?;
+        let fresh = serde_json::to_vec(replacement)?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO device_store (key, value) VALUES (?1, ?2)",
+            rusqlite::params![archive_key, current],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO device_store (key, value) VALUES ('state', ?1)",
+            rusqlite::params![fresh],
+        )?;
+        transaction.commit()?;
+        Ok(archive_key)
+    }
+
     /// Load the store from a SQLite database, or return None if not found.
     pub fn load_from_db(conn: &rusqlite::Connection) -> anyhow::Result<Option<Self>> {
         // Table might not exist yet
@@ -207,5 +240,41 @@ impl DeviceStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_registration_is_archived_before_fresh_pairing_state_is_activated() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut current = DeviceStore::new();
+        current.our_jid = Some("saved-device@s.whatsapp.net".into());
+        current.save_to_db(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT);
+             INSERT INTO messages (id, body) VALUES ('kept', 'history');"
+        ).unwrap();
+
+        let fresh = DeviceStore::new();
+        let archive_key = current.archive_and_replace_in_db(&mut conn, &fresh).unwrap();
+        let active = DeviceStore::load_from_db(&conn).unwrap().unwrap();
+        let archived: Vec<u8> = conn.query_row(
+            "SELECT value FROM device_store WHERE key = ?1",
+            [&archive_key],
+            |row| row.get(0),
+        ).unwrap();
+        let archived: DeviceStore = serde_json::from_slice(&archived).unwrap();
+        let message_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+
+        assert_eq!(archived.our_jid, current.our_jid);
+        assert!(active.our_jid.is_none());
+        assert_eq!(message_count, 1);
     }
 }

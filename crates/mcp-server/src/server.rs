@@ -13,7 +13,7 @@ use anyhow::Result;
 use qrcode::{Color, EcLevel, QrCode};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use wa_domain::ports::{PairingPhase, PairingSnapshot, StoragePort, WhatsAppClientPort};
 
 const PAIRING_WIDGET_HTML: &str = include_str!("../../../apps/whatsapp-pairing.html");
@@ -38,8 +38,16 @@ impl McpServer {
     /// Run the MCP server on stdio (blocking).
     pub async fn run_stdio(&self) -> Result<()> {
         let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        let stdout = tokio::io::stdout();
+        self.run_transport(stdin, stdout).await
+    }
+
+    pub async fn run_transport<R, W>(&self, input: R, mut output: W) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut reader = BufReader::new(input);
         let mut line = String::new();
 
         loop {
@@ -63,8 +71,8 @@ impl McpServer {
                         format!("Parse error: {e}"),
                     );
                     let out = serde_json::to_string(&err_response)? + "\n";
-                    stdout.write_all(out.as_bytes()).await?;
-                    stdout.flush().await?;
+                    output.write_all(out.as_bytes()).await?;
+                    output.flush().await?;
                     continue;
                 }
             };
@@ -77,8 +85,8 @@ impl McpServer {
 
             let response = self.handle_request(&request).await;
             let out = serde_json::to_string(&response)? + "\n";
-            stdout.write_all(out.as_bytes()).await?;
-            stdout.flush().await?;
+            output.write_all(out.as_bytes()).await?;
+            output.flush().await?;
         }
 
         Ok(())
@@ -276,6 +284,8 @@ impl McpServer {
             Some("search_contacts") => self.tool_search_contacts(req, &arguments).await,
             Some("get_chat_info") => self.tool_get_chat_info(req, &arguments).await,
             Some("send_message") => self.tool_send_message(req, &arguments).await,
+            Some("edit_message") => self.tool_edit_message(req, &arguments).await,
+            Some("delete_message") => self.tool_delete_message(req, &arguments).await,
             Some("get_connection_status") => self.tool_connection_status(req).await,
             Some("open_pairing") | Some("get_pairing_status") => {
                 self.tool_pairing_status(req).await
@@ -285,7 +295,7 @@ impl McpServer {
                 req.id.clone(),
                 -32602,
                 format!(
-                    "Unknown tool '{}'. Available tools: list_chats, get_messages, search_contacts, get_chat_info, send_message, get_connection_status, open_pairing, get_pairing_status, restart_pairing.",
+                    "Unknown tool '{}'. Available tools: list_chats, get_messages, search_contacts, get_chat_info, send_message, edit_message, delete_message, get_connection_status, open_pairing, get_pairing_status, restart_pairing.",
                     unknown
                 ),
             ),
@@ -511,6 +521,87 @@ impl McpServer {
                     e
                 ),
             ),
+        }
+    }
+
+    async fn tool_edit_message(&self, req: &JsonRpcRequest, args: &serde_json::Value) -> JsonRpcResponse {
+        let chat_id = match args.get("chat_id").and_then(|value| value.as_str()) {
+            Some(value) => wa_domain::models::chat::ChatId(value.into()),
+            None => return self.tool_error(req, "Missing required parameter 'chat_id'."),
+        };
+        let message_id = match args.get("message_id").and_then(|value| value.as_str()) {
+            Some(value) => wa_domain::models::message::MessageId(value.into()),
+            None => return self.tool_error(req, "Missing required parameter 'message_id'."),
+        };
+        let text = match args.get("text").and_then(|value| value.as_str()) {
+            Some(value) if !value.is_empty() => value,
+            _ => return self.tool_error(req, "Missing or empty required parameter 'text'."),
+        };
+        match self.storage.get_message(&chat_id, &message_id).await {
+            Ok(Some(message)) if message.is_from_me => {}
+            Ok(Some(_)) => return self.tool_error(req, "Only messages sent by this account can be edited."),
+            Ok(None) => return self.tool_error(req, "Message not found in the selected chat. Refresh with get_messages and use the exact IDs."),
+            Err(error) => return self.tool_error(req, &format!("Could not validate target message: {error}")),
+        }
+        match self.wa_client.edit_message(&chat_id, &message_id.0, text).await {
+            Ok(message) => {
+                let persisted = self
+                    .storage
+                    .update_message_text(&chat_id, &message_id, text, message.timestamp)
+                    .await
+                    .unwrap_or(false);
+                let result = ToolResult {
+                    content: vec![ToolResultContent {
+                        content_type: "text".into(),
+                        text: format!("Message edited successfully. ID: {}, Timestamp: {}, Local cache updated: {}", message.id.0, message.timestamp, persisted),
+                    }],
+                    structured_content: Some(json!({
+                        "message_id": message.id.0,
+                        "timestamp": message.timestamp,
+                        "local_cache_updated": persisted,
+                    })),
+                    meta: None,
+                    is_error: None,
+                };
+                JsonRpcResponse::success(req.id.clone(), serde_json::to_value(result).unwrap())
+            }
+            Err(error) => self.tool_error(req, &format!("Failed to edit message: {error}. Do not retry until get_messages confirms the current remote state.")),
+        }
+    }
+
+    async fn tool_delete_message(&self, req: &JsonRpcRequest, args: &serde_json::Value) -> JsonRpcResponse {
+        let chat_id = match args.get("chat_id").and_then(|value| value.as_str()) {
+            Some(value) => wa_domain::models::chat::ChatId(value.into()),
+            None => return self.tool_error(req, "Missing required parameter 'chat_id'."),
+        };
+        let message_id = match args.get("message_id").and_then(|value| value.as_str()) {
+            Some(value) => wa_domain::models::message::MessageId(value.into()),
+            None => return self.tool_error(req, "Missing required parameter 'message_id'."),
+        };
+        match self.storage.get_message(&chat_id, &message_id).await {
+            Ok(Some(message)) if message.is_from_me => {}
+            Ok(Some(_)) => return self.tool_error(req, "Only messages sent by this account can be deleted."),
+            Ok(None) => return self.tool_error(req, "Message not found in the selected chat. Refresh with get_messages and use the exact IDs."),
+            Err(error) => return self.tool_error(req, &format!("Could not validate target message: {error}")),
+        }
+        match self.wa_client.delete_message(&chat_id, &message_id.0).await {
+            Ok(()) => {
+                let removed = self.storage.delete_message(&chat_id, &message_id).await.unwrap_or(false);
+                let result = ToolResult {
+                    content: vec![ToolResultContent {
+                        content_type: "text".into(),
+                        text: format!("Message deleted successfully. ID: {}, Local cache removed: {}", message_id.0, removed),
+                    }],
+                    structured_content: Some(json!({
+                        "message_id": message_id.0,
+                        "local_cache_removed": removed,
+                    })),
+                    meta: None,
+                    is_error: None,
+                };
+                JsonRpcResponse::success(req.id.clone(), serde_json::to_value(result).unwrap())
+            }
+            Err(error) => self.tool_error(req, &format!("Failed to delete message: {error}. Do not retry until get_messages confirms the current remote state.")),
         }
     }
 
@@ -769,7 +860,7 @@ fn pairing_response(req: &JsonRpcRequest, snapshot: &PairingSnapshot) -> JsonRpc
             "session_disconnected",
             false,
             true,
-            "A saved session exists but is disconnected. Retry to reconnect it; the saved session will be preserved.",
+            "A saved session exists but is disconnected. Retry reconnects it; if WhatsApp rejects the registration, it is archived before a fresh QR is generated. Chat history is preserved.",
         ),
         PairingPhase::Unsupported => (
             "unsupported",
@@ -821,13 +912,8 @@ fn pairing_retry_failure_response(
     } else {
         "disconnected"
     };
-    let preservation = if has_saved_session {
-        "The saved session was preserved."
-    } else {
-        "No saved session was replaced."
-    };
     let message = format!(
-        "Could not reconnect WhatsApp: {error} Retry to try again. {preservation}"
+        "Could not reconnect WhatsApp: {error} Retry to try again. The database and any archived registration were preserved."
     );
     let structured = json!({
         "phase": phase,
@@ -1244,7 +1330,7 @@ mod tests {
         assert!(structured["message"]
             .as_str()
             .expect("message")
-            .contains("saved session was preserved"));
+            .contains("database and any archived registration were preserved"));
         assert!(result["_meta"].get("qr").is_none());
         assert!(!serialized.contains(secret));
     }

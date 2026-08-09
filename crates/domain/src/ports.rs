@@ -53,6 +53,14 @@ pub trait WhatsAppClientPort: Send + Sync {
     async fn disconnect(&self) -> Result<()>;
     /// Sends a text message to a specific chat (Contact or Group)
     async fn send_message(&self, chat_id: &ChatId, text: &str) -> Result<Message>;
+    /// Edits one previously sent text message.
+    async fn edit_message(&self, _chat_id: &ChatId, _message_id: &str, _text: &str) -> Result<Message> {
+        Err(anyhow::anyhow!("Message editing is not supported by this backend"))
+    }
+    /// Revokes one previously sent message for all participants.
+    async fn delete_message(&self, _chat_id: &ChatId, _message_id: &str) -> Result<()> {
+        Err(anyhow::anyhow!("Message deletion is not supported by this backend"))
+    }
     /// Sends an emoji reaction to a message
     async fn send_reaction(&self, chat_id: &ChatId, message_id: &str, emoji: &str) -> Result<()>;
     /// Sends an image message with optional caption
@@ -65,6 +73,24 @@ pub trait WhatsAppClientPort: Send + Sync {
 pub trait StoragePort: Send + Sync {
     async fn save_message(&self, msg: &Message) -> Result<()>;
     async fn get_messages(&self, chat_id: &ChatId, limit: u32, before_cursor: Option<&MessageId>) -> Result<Vec<Message>>;
+
+    async fn get_message(&self, _chat_id: &ChatId, _message_id: &MessageId) -> Result<Option<Message>> {
+        Ok(None)
+    }
+
+    async fn update_message_text(
+        &self,
+        _chat_id: &ChatId,
+        _message_id: &MessageId,
+        _text: &str,
+        _timestamp: i64,
+    ) -> Result<bool> {
+        Err(anyhow::anyhow!("Message updates are not supported by this storage backend"))
+    }
+
+    async fn delete_message(&self, _chat_id: &ChatId, _message_id: &MessageId) -> Result<bool> {
+        Err(anyhow::anyhow!("Message deletion is not supported by this storage backend"))
+    }
     
     async fn save_chat(&self, chat: &Chat) -> Result<()>;
     async fn get_chat(&self, chat_id: &ChatId) -> Result<Option<Chat>>;

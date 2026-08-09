@@ -2,7 +2,7 @@
 //!
 //! Consolidated, intent-based tools following Anthropic's best practices:
 //!
-//! - **Few tools, clear purpose**: 9 tools covering WhatsApp plus private setup UI.
+//! - **Few tools, clear purpose**: 11 tools covering WhatsApp plus private setup UI.
 //! - **"Job-to-be-Done" design**: Each tool is one user intent, not one API call.
 //! - **Exclusionary guidance**: Descriptions say when NOT to use a tool.
 //! - **ToolAnnotations**: readOnly/destructive/idempotent/openWorld hints.
@@ -26,6 +26,16 @@ fn read_only_annotations(title: &str) -> ToolAnnotations {
 fn send_annotations() -> ToolAnnotations {
     ToolAnnotations {
         title: "Send WhatsApp message".into(),
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: false,
+        open_world_hint: true,
+    }
+}
+
+fn message_mutation_annotations(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.into(),
         read_only_hint: false,
         destructive_hint: true,
         idempotent_hint: false,
@@ -200,7 +210,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             name: "send_message".into(),
             description: concat!(
                 "Send a text message to a WhatsApp chat. ",
-                "This is a DESTRUCTIVE action: the message will be delivered to the recipient and cannot be unsent via this tool. ",
+                "This is an external write: the message will be delivered to the recipient. ",
                 "Requires a valid chat_id from 'list_chats' or 'search_contacts'. ",
                 "The agent MUST confirm the recipient and message content with the user before calling this tool. ",
                 "Do NOT use this for media — media sending is not yet supported.",
@@ -222,6 +232,66 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
             }),
             output_schema: None,
             annotations: send_annotations(),
+            meta: None,
+        },
+
+        ToolDefinition {
+            name: "edit_message".into(),
+            description: concat!(
+                "Edit one text message previously sent by this WhatsApp account. ",
+                "This is an external write visible to chat participants. ",
+                "Requires the exact chat_id and message_id returned by get_messages. ",
+                "The agent MUST confirm the target message and replacement text with the user before calling this tool."
+            ).into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat_id": {
+                        "type": "string",
+                        "description": "The exact chat containing the message."
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "The exact identifier of a message sent by this account."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The replacement text. Must not be empty."
+                    }
+                },
+                "required": ["chat_id", "message_id", "text"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            annotations: message_mutation_annotations("Edit WhatsApp message"),
+            meta: None,
+        },
+
+        ToolDefinition {
+            name: "delete_message".into(),
+            description: concat!(
+                "Delete one message previously sent by this WhatsApp account for all participants. ",
+                "This is a destructive external write. ",
+                "Requires the exact chat_id and message_id returned by get_messages. ",
+                "The agent MUST confirm the target message with the user before calling this tool."
+            ).into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat_id": {
+                        "type": "string",
+                        "description": "The exact chat containing the message."
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "The exact identifier of a message sent by this account."
+                    }
+                },
+                "required": ["chat_id", "message_id"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            annotations: message_mutation_annotations("Delete WhatsApp message"),
             meta: None,
         },
 
@@ -251,7 +321,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "Open the private WhatsApp pairing setup in Codex. ",
                 "Use when the user asks to connect, pair, scan a QR code, or inspect setup state. ",
                 "The QR is rendered only inside the app and is never returned to the model. ",
-                "This tool never deletes or replaces an existing WhatsApp session."
+                "A server-rejected registration is archived before fresh pairing; chat history is retained."
             ).into(),
             input_schema: json!({
                 "type": "object",
@@ -279,9 +349,9 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "restart_pairing".into(),
             description: concat!(
-                "Retry a stalled first-time WhatsApp pairing attempt when no saved session exists, or retry reconnection for a disconnected saved session while preserving the database and session. ",
+                "Retry a stalled first-time pairing or reconnect a saved session. A registration rejected by WhatsApp is archived transactionally before a fresh QR is generated; chat history remains intact. ",
                 "Available only to the pairing app. ",
-                "Destructive session replacement is unavailable through MCP and requires the explicit legacy `--replace-existing-session` flag."
+                "The operation never deletes the database."
             ).into(),
             input_schema: json!({
                 "type": "object",
@@ -302,11 +372,16 @@ mod tests {
     #[test]
     fn registry_exposes_codex_safety_annotations() {
         let tools = tool_registry();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
 
         for tool in tools
             .iter()
-            .filter(|tool| tool.name != "send_message" && tool.name != "restart_pairing")
+            .filter(|tool| {
+                tool.name != "send_message"
+                    && tool.name != "edit_message"
+                    && tool.name != "delete_message"
+                    && tool.name != "restart_pairing"
+            })
         {
             assert!(
                 tool.annotations.read_only_hint,
@@ -338,6 +413,17 @@ mod tests {
         assert!(send.annotations.destructive_hint);
         assert!(!send.annotations.idempotent_hint);
         assert!(send.annotations.open_world_hint);
+
+        for name in ["edit_message", "delete_message"] {
+            let mutation = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("message mutation tool");
+            assert!(!mutation.annotations.read_only_hint);
+            assert!(mutation.annotations.destructive_hint);
+            assert!(!mutation.annotations.idempotent_hint);
+            assert!(mutation.annotations.open_world_hint);
+        }
 
         let restart = tools
             .iter()
