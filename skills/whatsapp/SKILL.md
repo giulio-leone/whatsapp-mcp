@@ -12,9 +12,10 @@ Use the bundled `whatsapp` MCP server for WhatsApp requests.
 1. Call `get_connection_status` before operations that need a live session. If first-time setup is needed, call `open_pairing` so Codex renders the private QR app.
 2. Resolve recipients through `list_chats` or `search_contacts`; never guess a `chat_id`.
 3. Use `get_messages` or `get_chat_info` for read-only requests.
-4. Before `send_message`, read back the exact resolved recipient and final message text. Treat a current-turn instruction containing both as approval; otherwise request explicit approval.
-5. Before `edit_message` or `delete_message`, read back the exact chat, message ID, current text, and requested mutation. Only messages sent by this account are eligible.
-6. Report the returned message ID after a successful write. Never retry an uncertain send, edit, or delete because duplicate external mutations cannot be proven safe.
+4. Write tools support one-to-one chats only and must fail closed for groups, broadcasts, and unresolved LID-only identifiers.
+5. Before `send_message`, read back the exact resolved recipient and final message text. Treat a current-turn instruction containing both as approval; otherwise request explicit approval.
+6. Before `edit_message` or `delete_message`, read back the exact chat, message ID, current text, and requested mutation. Only messages sent by this account are eligible.
+7. Report the returned message ID after a successful write. Never retry an uncertain send, edit, or delete because duplicate external mutations cannot be proven safe.
 
 ## Pairing boundary
 

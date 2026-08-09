@@ -209,7 +209,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "send_message".into(),
             description: concat!(
-                "Send a text message to a WhatsApp chat. ",
+                "Send a text message to a one-to-one WhatsApp chat. ",
                 "This is an external write: the message will be delivered to the recipient. ",
                 "Requires a valid chat_id from 'list_chats' or 'search_contacts'. ",
                 "The agent MUST confirm the recipient and message content with the user before calling this tool. ",
@@ -220,7 +220,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
                 "properties": {
                     "chat_id": {
                         "type": "string",
-                        "description": "The chat identifier to send the message to."
+                        "description": "The one-to-one chat identifier to send the message to."
                     },
                     "text": {
                         "type": "string",
@@ -238,7 +238,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "edit_message".into(),
             description: concat!(
-                "Edit one text message previously sent by this WhatsApp account. ",
+                "Edit one text message previously sent by this WhatsApp account in a one-to-one chat. ",
                 "This is an external write visible to chat participants. ",
                 "Requires the exact chat_id and message_id returned by get_messages. ",
                 "The agent MUST confirm the target message and replacement text with the user before calling this tool."
@@ -270,7 +270,7 @@ pub fn tool_registry() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "delete_message".into(),
             description: concat!(
-                "Delete one message previously sent by this WhatsApp account for all participants. ",
+                "Delete one message previously sent by this WhatsApp account from a one-to-one chat for all participants. ",
                 "This is a destructive external write. ",
                 "Requires the exact chat_id and message_id returned by get_messages. ",
                 "The agent MUST confirm the target message with the user before calling this tool."

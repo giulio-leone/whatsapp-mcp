@@ -169,13 +169,12 @@ impl StoragePort for SqliteStorage {
         chat_id: &ChatId,
         message_id: &MessageId,
         text: &str,
-        timestamp: i64,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let updated = conn.execute(
-            "UPDATE messages SET text = ?3, timestamp = ?4
+            "UPDATE messages SET text = ?3
              WHERE chat_id = ?1 AND id = ?2 AND is_from_me = 1",
-            rusqlite::params![chat_id.0, message_id.0, text, timestamp],
+            rusqlite::params![chat_id.0, message_id.0, text],
         )?;
         Ok(updated == 1)
     }
@@ -387,27 +386,27 @@ mod tests {
                 &ChatId("wrong-chat".into()),
                 &owned.id,
                 "must-not-change",
-                99,
             )
             .await
             .expect("wrong-chat update"));
         assert!(!storage
-            .update_message_text(&incoming.chat_id, &incoming.id, "must-not-change", 99)
+            .update_message_text(&incoming.chat_id, &incoming.id, "must-not-change")
             .await
             .expect("incoming update"));
         assert!(storage
-            .update_message_text(&owned.chat_id, &owned.id, "after", 99)
+            .update_message_text(&owned.chat_id, &owned.id, "after")
             .await
             .expect("owned update"));
         assert_eq!(
-            storage
+            {
+                let updated = storage
                 .get_message(&owned.chat_id, &owned.id)
                 .await
                 .expect("read owned")
-                .expect("owned exists")
-                .text
-                .as_deref(),
-            Some("after")
+                .expect("owned exists");
+                (updated.text, updated.timestamp)
+            },
+            (Some("after".into()), 42)
         );
 
         assert!(!storage

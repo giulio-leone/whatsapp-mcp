@@ -45,13 +45,45 @@ fn generate_message_id(our_jid: &str) -> String {
     format!("3EB0{}", hex::encode(&hash[..9]).to_uppercase())
 }
 
-fn encrypted_recipient_node(device_jid: &str, kind: &str, envelope: Vec<u8>) -> Node {
+fn ensure_one_to_one_chat(chat_id: &ChatId) -> Result<()> {
+    if chat_id.0.ends_with("@s.whatsapp.net") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Message writes currently support one-to-one WhatsApp chats only"
+        ))
+    }
+}
+
+fn ensure_recipient_encryption(recipient_node_count: usize) -> Result<()> {
+    if recipient_node_count == 0 {
+        Err(anyhow!("Failed to encrypt for any recipient device"))
+    } else {
+        Ok(())
+    }
+}
+
+fn encrypted_recipient_node(
+    device_jid: &str,
+    kind: &str,
+    envelope: Vec<u8>,
+    hide_decrypt_failure: bool,
+) -> Node {
+    let mut encrypted_attrs = [
+        ("v".into(), AttrValue::String("2".into())),
+        ("type".into(), AttrValue::String(kind.into())),
+    ]
+    .into_iter()
+    .collect::<HashMap<_, _>>();
+    if hide_decrypt_failure {
+        encrypted_attrs.insert(
+            "decrypt-fail".into(),
+            AttrValue::String("hide".into()),
+        );
+    }
     let encrypted = Node::new(
         "enc",
-        [
-            ("v".into(), AttrValue::String("2".into())),
-            ("type".into(), AttrValue::String(kind.into())),
-        ].into_iter().collect(),
+        encrypted_attrs,
         Content::Bytes(envelope),
     );
     Node::new(
@@ -61,15 +93,15 @@ fn encrypted_recipient_node(device_jid: &str, kind: &str, envelope: Vec<u8>) -> 
     )
 }
 
-fn edit_protocol_message(
+fn edit_message_envelope(
     chat_id: &ChatId,
     message_id: &str,
     text: &str,
     timestamp_ms: i64,
-) -> crate::proto::wa_web_protobufs_e2e::ProtocolMessage {
+) -> crate::proto::wa_web_protobufs_e2e::Message {
     use crate::proto::wa_common::MessageKey;
     use crate::proto::wa_web_protobufs_e2e as e2e;
-    e2e::ProtocolMessage {
+    let protocol_message = e2e::ProtocolMessage {
         key: Some(MessageKey {
             remote_jid: Some(chat_id.0.clone()),
             from_me: Some(true),
@@ -83,27 +115,90 @@ fn edit_protocol_message(
         })),
         timestamp_ms: Some(timestamp_ms),
         ..Default::default()
+    };
+    e2e::Message {
+        edited_message: Some(Box::new(e2e::FutureProofMessage {
+            message: Some(Box::new(e2e::Message {
+                protocol_message: Some(Box::new(protocol_message)),
+                ..Default::default()
+            })),
+        })),
+        ..Default::default()
     }
 }
 
-fn delete_protocol_message(
+fn delete_message_envelope(
     chat_id: &ChatId,
     message_id: &str,
     timestamp_ms: i64,
-) -> crate::proto::wa_web_protobufs_e2e::ProtocolMessage {
+) -> crate::proto::wa_web_protobufs_e2e::Message {
     use crate::proto::wa_common::MessageKey;
     use crate::proto::wa_web_protobufs_e2e as e2e;
-    e2e::ProtocolMessage {
-        key: Some(MessageKey {
-            remote_jid: Some(chat_id.0.clone()),
-            from_me: Some(true),
-            id: Some(message_id.into()),
-            participant: None,
-        }),
-        r#type: Some(e2e::protocol_message::Type::Revoke.into()),
-        timestamp_ms: Some(timestamp_ms),
+    e2e::Message {
+        protocol_message: Some(Box::new(e2e::ProtocolMessage {
+            key: Some(MessageKey {
+                remote_jid: Some(chat_id.0.clone()),
+                from_me: Some(true),
+                id: Some(message_id.into()),
+                participant: None,
+            }),
+            r#type: Some(e2e::protocol_message::Type::Revoke.into()),
+            timestamp_ms: Some(timestamp_ms),
+            ..Default::default()
+        })),
         ..Default::default()
     }
+}
+
+#[derive(Clone, Copy)]
+enum MessageMutation {
+    Edit,
+    Delete,
+}
+
+impl MessageMutation {
+    fn wire_attribute(self) -> &'static str {
+        match self {
+            Self::Edit => "1",
+            Self::Delete => "7",
+        }
+    }
+}
+
+fn mutation_message_node(
+    message_id: String,
+    jid: String,
+    recipients: Vec<Node>,
+    account_identity: Option<Vec<u8>>,
+    any_prekey_message: bool,
+    mutation: MessageMutation,
+) -> Node {
+    let participants = Node::new("participants", HashMap::new(), Content::Nodes(recipients));
+    let mut children = vec![participants];
+    if any_prekey_message {
+        if let Some(identity) = account_identity {
+            children.push(Node::new(
+                "device-identity",
+                HashMap::new(),
+                Content::Bytes(identity),
+            ));
+        }
+    }
+    Node::new(
+        "message",
+        [
+            ("id".into(), AttrValue::String(message_id)),
+            ("to".into(), AttrValue::String(jid)),
+            ("type".into(), AttrValue::String("text".into())),
+            (
+                "edit".into(),
+                AttrValue::String(mutation.wire_attribute().into()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        Content::Nodes(children),
+    )
 }
 
 #[cfg(unix)]
@@ -311,14 +406,15 @@ impl WhatsAppClient {
         }
     }
 
-    async fn relay_protocol_message(
+    async fn relay_message_mutation(
         &self,
         chat_id: &ChatId,
-        protocol_message: crate::proto::wa_web_protobufs_e2e::ProtocolMessage,
+        message: crate::proto::wa_web_protobufs_e2e::Message,
+        mutation: MessageMutation,
     ) -> Result<String> {
         use crate::proto::wa_web_protobufs_e2e as e2e;
+        ensure_one_to_one_chat(chat_id)?;
         let jid = chat_id.0.clone();
-        let is_broadcast = jid.contains("@broadcast");
         let user_part = jid.split('@').next().unwrap_or(&jid);
         let our_jid = self.store.lock().await.our_jid.clone().unwrap_or_default();
         let our_user = our_jid.split(':').next().unwrap_or("").split('@').next().unwrap_or("");
@@ -326,15 +422,7 @@ impl WhatsAppClient {
             .and_then(|value| value.split('@').next())
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(0);
-        let message = e2e::Message {
-            protocol_message: Some(Box::new(protocol_message)),
-            ..Default::default()
-        };
-        let recipient_devices = if is_broadcast {
-            Vec::new()
-        } else {
-            self.discover_devices(user_part).await
-        };
+        let recipient_devices = self.discover_devices(user_part).await;
         let own_devices = if our_user.is_empty() {
             Vec::new()
         } else {
@@ -346,17 +434,13 @@ impl WhatsAppClient {
         let mut encoded = Vec::new();
         message.encode(&mut encoded)?;
         let recipient_payload = Self::pad_message(&encoded);
-        let own_message = if is_broadcast {
-            message.clone()
-        } else {
-            e2e::Message {
-                device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
-                    destination_jid: Some(jid.clone()),
-                    message: Some(Box::new(message.clone())),
-                    ..Default::default()
-                })),
+        let own_message = e2e::Message {
+            device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
+                destination_jid: Some(jid.clone()),
+                message: Some(Box::new(message.clone())),
                 ..Default::default()
-            }
+            })),
+            ..Default::default()
         };
         let mut own_encoded = Vec::new();
         own_message.encode(&mut own_encoded)?;
@@ -370,43 +454,43 @@ impl WhatsAppClient {
             match self.encrypt_for_device(&device_jid, &recipient_payload).await {
                 Ok((kind, envelope, session)) => {
                     any_prekey_message |= kind == "pkmsg";
-                    recipients.push(encrypted_recipient_node(&device_jid, &kind, envelope));
+                    recipients.push(encrypted_recipient_node(
+                        &device_jid,
+                        &kind,
+                        envelope,
+                        true,
+                    ));
                     sessions.push((device_jid, serde_json::to_vec(&session)?));
                 }
                 Err(error) => tracing::warn!("Failed to encrypt protocol message for {}: {}", device_jid, error),
             }
         }
+        ensure_recipient_encryption(recipients.len())?;
         for device_id in own_devices {
             let device_jid = format!("{}:{}@s.whatsapp.net", our_user, device_id);
             match self.encrypt_for_device(&device_jid, &own_payload).await {
                 Ok((kind, envelope, session)) => {
                     any_prekey_message |= kind == "pkmsg";
-                    recipients.push(encrypted_recipient_node(&device_jid, &kind, envelope));
+                    recipients.push(encrypted_recipient_node(
+                        &device_jid,
+                        &kind,
+                        envelope,
+                        true,
+                    ));
                     sessions.push((device_jid, serde_json::to_vec(&session)?));
                 }
                 Err(error) => tracing::warn!("Failed to encrypt protocol message for own device {}: {}", device_jid, error),
             }
         }
-        if recipients.is_empty() {
-            return Err(anyhow!("Failed to encrypt protocol message for any device"));
-        }
-
         let message_id = generate_message_id(&our_jid);
-        let participants = Node::new("participants", HashMap::new(), Content::Nodes(recipients));
-        let mut children = vec![participants];
-        if any_prekey_message {
-            if let Some(identity) = self.store.lock().await.account_identity.clone() {
-                children.push(Node::new("device-identity", HashMap::new(), Content::Bytes(identity)));
-            }
-        }
-        let message_node = Node::new(
-            "message",
-            [
-                ("id".into(), AttrValue::String(message_id.clone())),
-                ("to".into(), AttrValue::String(jid)),
-                ("type".into(), AttrValue::String("text".into())),
-            ].into_iter().collect(),
-            Content::Nodes(children),
+        let account_identity = self.store.lock().await.account_identity.clone();
+        let message_node = mutation_message_node(
+            message_id.clone(),
+            jid,
+            recipients,
+            account_identity,
+            any_prekey_message,
+            mutation,
         );
         self.send_node(&message_node).await?;
         {
@@ -567,10 +651,10 @@ impl WhatsAppClientPort for WhatsAppClient {
     }
 
     async fn send_message(&self, chat_id: &ChatId, text: &str) -> Result<Message> {
+        ensure_one_to_one_chat(chat_id)?;
         let jid = chat_id.0.clone();
         tracing::info!("Sending message to {}", jid);
 
-        let is_broadcast = jid.contains("@broadcast");
         let user_part = jid.split('@').next().unwrap_or(&jid);
 
         // Our own JID info (needed for fanout + msg ID)
@@ -581,13 +665,8 @@ impl WhatsAppClientPort for WhatsAppClient {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // 1. Discover recipient devices via usync (skip for broadcast JIDs)
-        let recipient_devices = if is_broadcast {
-            tracing::info!("Broadcast JID — skipping recipient device discovery");
-            vec![]
-        } else {
-            self.discover_devices(user_part).await
-        };
+        // 1. Discover recipient devices via usync.
+        let recipient_devices = self.discover_devices(user_part).await;
         tracing::info!("Recipient devices for {}: {:?}", user_part, recipient_devices);
 
         // 2. Discover our own devices for fanout (exclude self)
@@ -636,16 +715,12 @@ impl WhatsAppClientPort for WhatsAppClient {
             match self.encrypt_for_device(&device_jid, &padded).await {
                 Ok((enc_type, envelope, session)) => {
                     if enc_type == "pkmsg" { any_pkmsg = true; }
-
-                    let mut enc_attrs = HashMap::new();
-                    enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
-                    enc_attrs.insert("type".to_string(), AttrValue::String(enc_type));
-                    let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
-
-                    let mut to_attrs = HashMap::new();
-                    to_attrs.insert("jid".to_string(), AttrValue::String(device_jid.clone()));
-                    let to_node = Node::new("to", to_attrs, Content::Nodes(vec![enc_node]));
-                    to_nodes.push(to_node);
+                    to_nodes.push(encrypted_recipient_node(
+                        &device_jid,
+                        &enc_type,
+                        envelope,
+                        false,
+                    ));
 
                     let session_bytes = serde_json::to_vec(&session)?;
                     sessions_to_persist.push((device_jid, session_bytes));
@@ -655,44 +730,36 @@ impl WhatsAppClientPort for WhatsAppClient {
                 }
             }
         }
+        ensure_recipient_encryption(to_nodes.len())?;
 
-        // 6. Encrypt for own devices (fanout)
-        // For broadcast: use raw message; for DM: wrap in DeviceSentMessage
+        // 6. Encrypt for own devices (fanout) using DeviceSentMessage.
         if !own_devices.is_empty() {
-            let own_padded = if is_broadcast {
-                padded.clone()
-            } else {
-                let dsm = e2e::Message {
-                    device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
-                        destination_jid: Some(jid.clone()),
-                        message: Some(Box::new(e2e::Message {
-                            conversation: Some(text.to_string()),
-                            ..Default::default()
-                        })),
+            let dsm = e2e::Message {
+                device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
+                    destination_jid: Some(jid.clone()),
+                    message: Some(Box::new(e2e::Message {
+                        conversation: Some(text.to_string()),
                         ..Default::default()
                     })),
                     ..Default::default()
-                };
-                let mut dsm_bytes = Vec::new();
-                dsm.encode(&mut dsm_bytes)?;
-                Self::pad_message(&dsm_bytes)
+                })),
+                ..Default::default()
             };
+            let mut dsm_bytes = Vec::new();
+            dsm.encode(&mut dsm_bytes)?;
+            let own_padded = Self::pad_message(&dsm_bytes);
 
             for device_id in &own_devices {
                 let device_jid = format!("{}:{}@s.whatsapp.net", our_user, device_id);
                 match self.encrypt_for_device(&device_jid, &own_padded).await {
                     Ok((enc_type, envelope, session)) => {
                         if enc_type == "pkmsg" { any_pkmsg = true; }
-
-                        let mut enc_attrs = HashMap::new();
-                        enc_attrs.insert("v".to_string(), AttrValue::String("2".to_string()));
-                        enc_attrs.insert("type".to_string(), AttrValue::String(enc_type));
-                        let enc_node = Node::new("enc", enc_attrs, Content::Bytes(envelope));
-
-                        let mut to_attrs = HashMap::new();
-                        to_attrs.insert("jid".to_string(), AttrValue::String(device_jid.clone()));
-                        let to_node = Node::new("to", to_attrs, Content::Nodes(vec![enc_node]));
-                        to_nodes.push(to_node);
+                        to_nodes.push(encrypted_recipient_node(
+                            &device_jid,
+                            &enc_type,
+                            envelope,
+                            false,
+                        ));
 
                         let session_bytes = serde_json::to_vec(&session)?;
                         sessions_to_persist.push((device_jid, session_bytes));
@@ -702,11 +769,6 @@ impl WhatsAppClientPort for WhatsAppClient {
                     }
                 }
             }
-        }
-
-        // Check after both recipient + own device encryption
-        if to_nodes.is_empty() {
-            return Err(anyhow!("Failed to encrypt for any device (recipient + own)"));
         }
 
         // 7. Build message node
@@ -758,9 +820,15 @@ impl WhatsAppClientPort for WhatsAppClient {
 
     async fn edit_message(&self, chat_id: &ChatId, message_id: &str, text: &str) -> Result<Message> {
         let timestamp = chrono::Utc::now().timestamp();
-        self.relay_protocol_message(
+        self.relay_message_mutation(
             chat_id,
-            edit_protocol_message(chat_id, message_id, text, chrono::Utc::now().timestamp_millis()),
+            edit_message_envelope(
+                chat_id,
+                message_id,
+                text,
+                chrono::Utc::now().timestamp_millis(),
+            ),
+            MessageMutation::Edit,
         ).await?;
         Ok(Message {
             id: MessageId(message_id.into()),
@@ -776,9 +844,14 @@ impl WhatsAppClientPort for WhatsAppClient {
     }
 
     async fn delete_message(&self, chat_id: &ChatId, message_id: &str) -> Result<()> {
-        self.relay_protocol_message(
+        self.relay_message_mutation(
             chat_id,
-            delete_protocol_message(chat_id, message_id, chrono::Utc::now().timestamp_millis()),
+            delete_message_envelope(
+                chat_id,
+                message_id,
+                chrono::Utc::now().timestamp_millis(),
+            ),
+            MessageMutation::Delete,
         ).await?;
         Ok(())
     }
@@ -2781,7 +2854,11 @@ impl WhatsAppClient {
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use super::{WhatsAppClient, delete_protocol_message, edit_protocol_message};
+    use super::{
+        MessageMutation, WhatsAppClient, delete_message_envelope, edit_message_envelope,
+        encrypted_recipient_node, ensure_one_to_one_chat, ensure_recipient_encryption,
+        mutation_message_node,
+    };
     use crate::binary::node::{AttrValue, Content, Node};
     use crate::client::WhatsAppEvent;
     use crate::proto::wa_common::MessageKey;
@@ -2795,6 +2872,7 @@ mod lifecycle_tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+    use wa_domain::models::chat::ChatId;
 
     struct DropMarker(Arc<AtomicBool>);
 
@@ -2815,17 +2893,98 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn edit_and_delete_use_whatsapp_protocol_messages_for_owned_target() {
+    fn edit_and_delete_match_whatsapp_envelopes_and_wire_attributes() {
         use crate::proto::wa_web_protobufs_e2e::protocol_message::Type;
         let chat_id = wa_domain::models::chat::ChatId("target@s.whatsapp.net".into());
-        let edit = edit_protocol_message(&chat_id, "message-1", "replacement", 123);
-        let delete = delete_protocol_message(&chat_id, "message-1", 124);
-        assert_eq!(edit.r#type, Some(Type::MessageEdit.into()));
-        assert_eq!(edit.key.as_ref().unwrap().from_me, Some(true));
-        assert_eq!(edit.edited_message.as_ref().unwrap().conversation.as_deref(), Some("replacement"));
-        assert_eq!(delete.r#type, Some(Type::Revoke.into()));
-        assert_eq!(delete.key.as_ref().unwrap().from_me, Some(true));
-        assert!(delete.edited_message.is_none());
+        let edit = edit_message_envelope(&chat_id, "message-1", "replacement", 123);
+        let delete = delete_message_envelope(&chat_id, "message-1", 124);
+        let edit_protocol = edit
+            .edited_message
+            .as_ref()
+            .unwrap()
+            .message
+            .as_ref()
+            .unwrap()
+            .protocol_message
+            .as_ref()
+            .unwrap();
+        let delete_protocol = delete.protocol_message.as_ref().unwrap();
+        assert_eq!(edit_protocol.r#type, Some(Type::MessageEdit.into()));
+        assert_eq!(edit_protocol.key.as_ref().unwrap().from_me, Some(true));
+        assert_eq!(
+            edit_protocol
+                .edited_message
+                .as_ref()
+                .unwrap()
+                .conversation
+                .as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(delete_protocol.r#type, Some(Type::Revoke.into()));
+        assert_eq!(delete_protocol.key.as_ref().unwrap().from_me, Some(true));
+        assert!(delete_protocol.edited_message.is_none());
+
+        let recipient = encrypted_recipient_node(
+            "target:1@s.whatsapp.net",
+            "msg",
+            vec![1, 2, 3],
+            true,
+        );
+        let node = mutation_message_node(
+            "new-message-id".into(),
+            chat_id.0,
+            vec![recipient],
+            None,
+            false,
+            MessageMutation::Edit,
+        );
+        assert_eq!(node.get_attr("edit"), Some("1"));
+        let encrypted = node
+            .get_child_by_tag("participants")
+            .unwrap()
+            .get_child_by_tag("to")
+            .unwrap()
+            .get_child_by_tag("enc")
+            .unwrap();
+        assert_eq!(encrypted.get_attr("decrypt-fail"), Some("hide"));
+
+        let delete_node = mutation_message_node(
+            "delete-message-id".into(),
+            "target@s.whatsapp.net".into(),
+            Vec::new(),
+            None,
+            false,
+            MessageMutation::Delete,
+        );
+        assert_eq!(delete_node.get_attr("edit"), Some("7"));
+    }
+
+    #[test]
+    fn writes_fail_closed_for_unsupported_group_and_broadcast_chats() {
+        assert!(ensure_one_to_one_chat(&ChatId("person@s.whatsapp.net".into())).is_ok());
+        assert!(ensure_one_to_one_chat(&ChatId("group@g.us".into())).is_err());
+        assert!(ensure_one_to_one_chat(&ChatId("status@broadcast".into())).is_err());
+    }
+
+    #[test]
+    fn own_device_fanout_cannot_mask_missing_recipient_encryption() {
+        assert!(ensure_recipient_encryption(0).is_err());
+        assert!(ensure_recipient_encryption(1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn group_mutations_fail_before_any_network_write() {
+        let client = WhatsAppClient::new();
+        let chat_id = wa_domain::models::chat::ChatId("group@g.us".into());
+        let error = client
+            .relay_message_mutation(
+                &chat_id,
+                delete_message_envelope(&chat_id, "message-1", 124),
+                MessageMutation::Delete,
+            )
+            .await
+            .expect_err("groups must fail closed until sender-key sending is supported");
+        assert!(error.to_string().contains("one-to-one"));
     }
 
     #[tokio::test]

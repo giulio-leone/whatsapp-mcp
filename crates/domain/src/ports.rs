@@ -51,13 +51,13 @@ pub trait WhatsAppClientPort: Send + Sync {
     }
     /// Disconnects gracefully
     async fn disconnect(&self) -> Result<()>;
-    /// Sends a text message to a specific chat (Contact or Group)
+    /// Sends a text message to a one-to-one chat.
     async fn send_message(&self, chat_id: &ChatId, text: &str) -> Result<Message>;
-    /// Edits one previously sent text message.
+    /// Edits one previously sent text message in a one-to-one chat.
     async fn edit_message(&self, _chat_id: &ChatId, _message_id: &str, _text: &str) -> Result<Message> {
         Err(anyhow::anyhow!("Message editing is not supported by this backend"))
     }
-    /// Revokes one previously sent message for all participants.
+    /// Revokes one previously sent message in a one-to-one chat.
     async fn delete_message(&self, _chat_id: &ChatId, _message_id: &str) -> Result<()> {
         Err(anyhow::anyhow!("Message deletion is not supported by this backend"))
     }
@@ -83,7 +83,6 @@ pub trait StoragePort: Send + Sync {
         _chat_id: &ChatId,
         _message_id: &MessageId,
         _text: &str,
-        _timestamp: i64,
     ) -> Result<bool> {
         Err(anyhow::anyhow!("Message updates are not supported by this storage backend"))
     }

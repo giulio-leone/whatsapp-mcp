@@ -55,9 +55,9 @@ Built in Rust with zero-copy binary codec, Signal protocol encryption, and an ag
 | `get_messages` | 🟢 read-only | Retrieve messages with cursor pagination |
 | `search_contacts` | 🟢 read-only | Search contacts by name/number |
 | `get_chat_info` | 🟢 read-only | Get detailed info for a single chat |
-| `send_message` | 🟡 write | Send a text message (requires confirmation) |
-| `edit_message` | 🟡 write | Edit a text message sent by this account (requires confirmation) |
-| `delete_message` | 🔴 destructive | Delete a message sent by this account for all participants (requires confirmation) |
+| `send_message` | 🟡 write | Send a text message to a one-to-one chat (requires confirmation) |
+| `edit_message` | 🟡 write | Edit a text message sent by this account in a one-to-one chat (requires confirmation) |
+| `delete_message` | 🔴 destructive | Delete a message sent by this account from a one-to-one chat (requires confirmation) |
 | `get_connection_status` | 🟢 read-only | Check WhatsApp session health |
 | `open_pairing` | 🟢 read-only | Open the private pairing app in Codex |
 | `get_pairing_status` | 🟢 app-only | Poll pairing state without exposing the QR to the model |

@@ -486,6 +486,12 @@ impl McpServer {
                 );
             }
         };
+        if !chat_id.0.ends_with("@s.whatsapp.net") {
+            return self.tool_error(
+                req,
+                "Message writes currently support one-to-one WhatsApp chats only.",
+            );
+        }
         let text = match args.get("text").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
             _ => {
@@ -533,6 +539,12 @@ impl McpServer {
             Some(value) => wa_domain::models::message::MessageId(value.into()),
             None => return self.tool_error(req, "Missing required parameter 'message_id'."),
         };
+        if !chat_id.0.ends_with("@s.whatsapp.net") {
+            return self.tool_error(
+                req,
+                "Message writes currently support one-to-one WhatsApp chats only.",
+            );
+        }
         let text = match args.get("text").and_then(|value| value.as_str()) {
             Some(value) if !value.is_empty() => value,
             _ => return self.tool_error(req, "Missing or empty required parameter 'text'."),
@@ -547,7 +559,7 @@ impl McpServer {
             Ok(message) => {
                 let persisted = self
                     .storage
-                    .update_message_text(&chat_id, &message_id, text, message.timestamp)
+                    .update_message_text(&chat_id, &message_id, text)
                     .await
                     .unwrap_or(false);
                 let result = ToolResult {
@@ -578,6 +590,12 @@ impl McpServer {
             Some(value) => wa_domain::models::message::MessageId(value.into()),
             None => return self.tool_error(req, "Missing required parameter 'message_id'."),
         };
+        if !chat_id.0.ends_with("@s.whatsapp.net") {
+            return self.tool_error(
+                req,
+                "Message writes currently support one-to-one WhatsApp chats only.",
+            );
+        }
         match self.storage.get_message(&chat_id, &message_id).await {
             Ok(Some(message)) if message.is_from_me => {}
             Ok(Some(_)) => return self.tool_error(req, "Only messages sent by this account can be deleted."),
